@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+"""
+Gemini Chat CLI - 多轮会话命令行工具
+支持多种后端：本地Gemini Reverse API、NexusAI等
+
+用法:
+    gchat                    # 交互式多轮会话（默认flash模型）
+    gchat -m pro             # 使用pro模型
+    gchat -m pro3            # 使用gemini-3.0-pro模型
+    gchat -p "你好"          # 单次提问
+    gchat --backend nexus    # 使用NexusAI后端
+    gchat --list-models      # 列出可用模型
+"""
+
+import argparse
+import json
+import os
+import sys
+import subprocess
+import readline  # 支持历史记录和行编辑
+import base64
+import mimetypes
+import re
+import shlex
+import shutil
+from pathlib import Path
+
+from wcwidth import wcswidth, wcwidth
+
+
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_terminal_paste(text: str) -> str:
+    """清理终端粘贴可能带来的控制字符/转义序列。
+
+    目的：避免把不可见控制字符带进 prompt / API 请求，或触发快捷键行为。
+    """
+    if not text:
+        return text
+
+    # 统一换行
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 常见的 bracketed paste 包裹
+    text = text.replace("\x1b[200~", "").replace("\x1b[201~", "")
+
+    # 移除不可见控制字符（保留换行/制表符）
+    return _CTRL_CHARS_RE.sub("", text)
+
+try:
+    from prompt_toolkit import prompt as pt_prompt
+    from prompt_toolkit.formatted_text import ANSI as PTANSI
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+except Exception:
+    pt_prompt = None
+    PTANSI = None
+    FileHistory = None
+    KeyBindings = None
+
+# 后端配置
+BACKENDS = {
+    "local": {
+        "url": "http://82.29.54.80:8100/v1/chat/completions",
+        "name": "Gemini Reverse API (本地)",
+        "supports_tools": False,
+    },
+    "nexus": {
+        "url": "https://nexusai.aihang365.com/v1/chat/completions",
+        "key": "GeminiReverseTest2025abcdefghijklmnopqrstuvwx",
+        "name": "NexusAI",
+        "supports_tools": False,
+    },
+    "official": {
+        "url": "https://gemini-official.aihang365.com/v1beta/models/{model}:generateContent",
+        "key": os.environ.get("GEMINI_API_KEY", ""),
+        "name": "Google Official API (via US Proxy)",
+        "supports_tools": True,
+        "default_model": "gemini-2.5-flash-lite",  # 有免费额度且支持tools
+    },
+}
+
+# 官方API模型映射 (逆向模型名 -> 官方模型名)
+OFFICIAL_MODEL_MAP = {
+    "gemini-3-flash-preview": "gemini-2.5-flash-lite",
+    "gemini-2.5-flash": "gemini-2.5-flash-lite",
+    "gemini-2.5-pro": "gemini-2.5-flash-lite",  # pro没免费额度，降级到flash-lite
+    "gemini-3.0-pro": "gemini-2.5-flash-lite",
+}
+
+# 模型别名
+MODEL_ALIASES = {
+    "flash": "gemini-3-flash-preview",  # 默认使用最新 3.0 Flash
+    "flash3": "gemini-3-flash-preview",
+    "flash2": "gemini-2.5-flash",  # 旧版 Flash
+    "pro": "gemini-2.5-pro",
+    "pro3": "gemini-3.0-pro",
+    "3": "gemini-3.0-pro",
+}
+
+# 预定义的常用工具
+BUILTIN_TOOLS = {
+    "weather": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "城市名称，如'北京'、'上海'"}
+            },
+            "required": ["city"]
+        }
+    },
+    "search": {
+        "name": "web_search",
+        "description": "搜索网页获取信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词"}
+            },
+            "required": ["query"]
+        }
+    },
+    "calculator": {
+        "name": "calculate",
+        "description": "执行数学计算",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "数学表达式，如'2+2'、'sqrt(16)'"}
+            },
+            "required": ["expression"]
+        }
+    },
+    "bash": {
+        "name": "run_bash",
+        "description": "执行bash命令",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的bash命令"}
+            },
+            "required": ["command"]
+        }
+    },
+}
+
+# 颜色输出
+class Color:
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    CYAN = '\033[96m'
+    BOLD = '\033[1m'
+    END = '\033[0m'
+
+def colored(text, color):
+    """返回带颜色的文本"""
+    if not sys.stdout.isatty():
+        return text
+    return f"{color}{text}{Color.END}"
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def readline_safe_prompt(prompt: str) -> str:
+    """让带 ANSI 颜色的 prompt 在 readline 下不破坏换行/光标定位。
+
+    Python 的 readline 会把 ANSI 控制序列也计入长度，导致长文本自动换行时光标错位。
+    用 \001/\002 包裹不可见字符片段可修复该问题。
+    """
+    if not sys.stdin.isatty():
+        return prompt
+
+    try:
+        # 若 readline 不可用，直接返回
+        import readline as _  # noqa: F401
+    except Exception:
+        return prompt
+
+    def _wrap(match: re.Match[str]) -> str:
+        return f"\001{match.group(0)}\002"
+
+    return ANSI_ESCAPE_RE.sub(_wrap, prompt)
+
+
+def get_input_history_path() -> str:
+    home = os.path.expanduser('~')
+    return os.path.join(home, '.gchat_input_history')
+
+
+def print_box(title: str, content: str) -> None:
+    width = shutil.get_terminal_size((100, 20)).columns
+    width = max(60, min(width, 140))
+
+    label = f"[{title}]"
+    top = f"┌{label}{'─' * max(1, width - 2 - len(label))}┐"
+    bottom = f"└{'─' * (width - 2)}┘"
+    print(colored(top, Color.CYAN))
+
+    def _wrap_display(raw: str, max_w: int) -> list[str]:
+        if raw == "":
+            return [""]
+
+        out: list[str] = []
+        buf: list[str] = []
+        cur_w = 0
+        for ch in raw.replace('\t', '    '):
+            ch_w = wcwidth(ch)
+            if ch_w < 0:
+                ch_w = 0
+            if cur_w + ch_w > max_w and buf:
+                out.append(''.join(buf))
+                buf = [ch]
+                cur_w = ch_w
+                continue
+            buf.append(ch)
+            cur_w += ch_w
+        out.append(''.join(buf))
+        return out
+
+    inner_w = width - 4
+    lines = content.splitlines() or [""]
+    for raw in lines:
+        for wline in _wrap_display(raw, inner_w):
+            line_w = wcswidth(wline)
+            if line_w < 0:
+                line_w = len(wline)
+            pad = " " * max(0, inner_w - line_w)
+            print(colored("│ ", Color.CYAN) + wline + pad + colored(" │", Color.CYAN))
+
+    print(colored(bottom, Color.CYAN))
+
+
+def is_image_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+
+    suffix = path.suffix.lower().lstrip('.')
+    return suffix in {
+        'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif', 'heic'
+    }
+
+
+def encode_image_to_data_url(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    if not mime:
+        # 尽量给一个合理默认
+        mime = f"image/{path.suffix.lower().lstrip('.')}" if path.suffix else "application/octet-stream"
+
+    data = path.read_bytes()
+    b64 = base64.b64encode(data).decode('ascii')
+    return f"data:{mime};base64,{b64}"
+
+
+def extract_local_image_paths(text: str) -> tuple[str, list[Path]]:
+    """从用户输入中提取本地图片路径（用于拖拽文件到终端场景）。
+
+    - 仅当 token 指向真实存在的文件且扩展名是图片时才认定为图片。
+    - 返回：移除图片路径后的文本 + 图片路径列表
+    """
+    # 仅对单行输入做自动识别，避免破坏用户多行文本格式
+    if '\n' in text:
+        return text, []
+
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError:
+        # 引号不配对等情况：保守处理，不自动提取
+        return text, []
+
+    image_paths: list[Path] = []
+    remaining: list[str] = []
+    for tok in tokens:
+        p = Path(tok).expanduser()
+        if is_image_file(p):
+            image_paths.append(p)
+        else:
+            remaining.append(tok)
+
+    cleaned_text = ' '.join(remaining).strip()
+    return cleaned_text, image_paths
+
+
+def normalize_messages_for_api(messages: list[dict]) -> list[dict]:
+    """把本地 message 结构转换为 OpenAI 兼容 payload。
+
+    支持 content 为：
+    - str
+    - list[{type:'text', text:'...'} | {type:'image_file', path:'...'}]
+    """
+    out: list[dict] = []
+    for msg in messages:
+        content = msg.get('content')
+        if isinstance(content, list):
+            parts: list[dict] = []
+            for part in content:
+                if part.get('type') == 'text':
+                    text = part.get('text', '')
+                    if text:
+                        parts.append({"type": "text", "text": text})
+                elif part.get('type') == 'image_file':
+                    path_str = part.get('path')
+                    if not path_str:
+                        continue
+                    p = Path(path_str).expanduser()
+                    if not is_image_file(p):
+                        continue
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": encode_image_to_data_url(p)},
+                    })
+                elif part.get('type') == 'image_url':
+                    # 兼容已是 OpenAI 格式的历史记录
+                    image_url = part.get('image_url')
+                    if isinstance(image_url, dict) and image_url.get('url'):
+                        parts.append({"type": "image_url", "image_url": {"url": image_url["url"]}})
+                else:
+                    # 未知 part 类型：忽略
+                    continue
+
+            # 如果 parts 为空，至少给一个空文本，避免部分后端报错
+            if not parts:
+                parts = [{"type": "text", "text": ""}]
+
+            out.append({"role": msg.get('role'), "content": parts})
+        else:
+            out.append({"role": msg.get('role'), "content": content})
+
+    return out
+
+def print_header():
+    """打印欢迎信息"""
+    print(colored("╔════════════════════════════════════════╗", Color.CYAN))
+    print(colored("║       Gemini Chat CLI v1.0             ║", Color.CYAN))
+    print(colored("║  /help 查看命令  /quit 退出            ║", Color.CYAN))
+    print(colored("║  /paste 多行输入；/mode 切换输入框模式  ║", Color.CYAN))
+    print(colored("╚════════════════════════════════════════╝", Color.CYAN))
+    print()
+
+def print_help():
+    """打印帮助信息"""
+    help_text = """
+可用命令:
+  /help, /h      显示帮助
+  /quit, /q      退出程序（自动保存会话历史）
+  /clear, /c     清空对话历史
+  /history       显示对话历史
+  /model <name>  切换模型 (flash/pro/pro3)
+  /backend <name> 切换后端 (local/nexus/official)
+  /status        显示当前状态
+  /save <file>   手动保存对话到指定文件
+  /load <file>   从文件加载对话
+  /paste         进入多行输入框（Ctrl+S 发送，Ctrl+G 取消；无 prompt_toolkit 时用 . 结束）
+  /img <path..> [text]  发送图片（也支持直接拖拽图片路径到输入）
+  /mode [normal|box]  切换输入模式（默认 normal）
+
+🔧 Function Calling (混合模式):
+  /tools                列出当前启用的工具
+  /tools add <name>     添加工具 (weather/search/calculator/bash)
+  /tools remove <name>  移除工具
+  /tools clear          清空所有工具
+  /tools list           列出所有可用工具
+  /call <prompt>        强制使用官方API进行Function Calling
+
+  💡 启用工具后，会自动切换到官方API后端
+
+快捷键:
+  Ctrl+C         中断当前操作
+  Ctrl+D         退出程序（自动保存会话历史）
+  上/下箭头      浏览历史输入
+
+输入模式:
+  normal: Enter 发送；输入末尾为 \\ 时续行
+  box:    多行输入框；Enter 换行；Ctrl+S 发送；Ctrl+G 取消
+
+自动保存:
+  退出时会自动保存会话到: gchat_history_YYYYMMDD_HHMMSS.json
+"""
+    print(colored(help_text, Color.YELLOW))
+
+def official_api_request(messages, model, tools=None, api_key=None):
+    """使用Google官方API发送请求（支持Function Calling）"""
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+
+    if not api_key:
+        return None, "[错误] 未设置 GEMINI_API_KEY 环境变量\n设置方法: export GEMINI_API_KEY='your-api-key'"
+
+    # 映射到官方模型名
+    official_model = OFFICIAL_MODEL_MAP.get(model, "gemini-2.5-flash-lite")
+
+    # 构建官方API格式的请求
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{official_model}:generateContent?key={api_key}"
+
+    # 转换消息格式 (OpenAI -> Gemini)
+    contents = []
+    for msg in messages:
+        role = "user" if msg["role"] == "user" else "model"
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            contents.append({"role": role, "parts": [{"text": content}]})
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if part.get("type") == "text":
+                    parts.append({"text": part.get("text", "")})
+            if parts:
+                contents.append({"role": role, "parts": parts})
+
+    payload = {"contents": contents}
+
+    # 添加工具定义
+    if tools:
+        payload["tools"] = [{"function_declarations": tools}]
+
+    curl_cmd = [
+        'curl', '-s', '-X', 'POST', url,
+        '-H', 'Content-Type: application/json',
+        '--max-time', '60',
+        '-d', json.dumps(payload)
+    ]
+
+    try:
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=65)
+
+        if result.returncode != 0:
+            return None, f"[curl错误 {result.returncode}]: {result.stderr}"
+
+        response_data = json.loads(result.stdout)
+
+        # 检查错误
+        if "error" in response_data:
+            error = response_data["error"]
+            return None, f"[API错误]: {error.get('message', json.dumps(error))}"
+
+        # 解析响应
+        candidates = response_data.get("candidates", [])
+        if not candidates:
+            return None, "[错误] 无响应内容"
+
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+
+        for part in parts:
+            # 检查是否有函数调用
+            if "functionCall" in part:
+                fc = part["functionCall"]
+                return {
+                    "type": "function_call",
+                    "name": fc.get("name"),
+                    "args": fc.get("args", {})
+                }, None
+            # 普通文本响应
+            if "text" in part:
+                return {"type": "text", "content": part["text"]}, None
+
+        return None, "[错误] 无法解析响应"
+
+    except subprocess.TimeoutExpired:
+        return None, "[超时]: 官方API请求超过60秒"
+    except json.JSONDecodeError as e:
+        return None, f"[JSON解析错误]: {e}"
+    except Exception as e:
+        return None, f"[错误]: {e}"
+
+
+def chat_request(messages, model, backend_config, retry=2, debug=False):
+    """发送聊天请求（使用curl，兼容性最好）"""
+    url = backend_config["url"]
+    payload = {
+        "model": model,
+        "messages": normalize_messages_for_api(messages),
+    }
+
+    # 构建curl命令
+    curl_cmd = [
+        'curl', '-X', 'POST', url,
+        '-H', 'Content-Type: application/json',
+        '--max-time', '120',
+        '--retry', str(retry),  # 自动重试
+        '--retry-delay', '2',    # 重试间隔2秒
+        '--connect-timeout', '30'  # 连接超时30秒
+    ]
+
+    # 调试模式显示详细信息
+    if not debug:
+        curl_cmd.insert(1, '-s')  # 静默模式
+
+    # 如果有API key，添加Authorization header
+    if "key" in backend_config:
+        curl_cmd.extend(['-H', f'Authorization: Bearer {backend_config["key"]}'])
+
+    # 添加请求体
+    curl_cmd.extend(['-d', json.dumps(payload)])
+
+    try:
+        # 执行curl命令
+        result = subprocess.run(
+            curl_cmd,
+            capture_output=True,
+            text=True,
+            timeout=125
+        )
+
+        if result.returncode != 0:
+            stderr_msg = result.stderr.strip() if result.stderr else "网络连接失败"
+
+            # 针对 curl 35 错误给出具体建议
+            if result.returncode == 35:
+                return (
+                    f"[SSL/TLS错误 35]: {stderr_msg}\n\n"
+                    f"可能原因:\n"
+                    f"1. 网络环境问题（WiFi不稳定、VPN干扰）\n"
+                    f"2. DNS解析问题\n"
+                    f"3. 防火墙/安全软件阻止\n\n"
+                    f"建议:\n"
+                    f"- 重试几次（可能是瞬时网络波动）\n"
+                    f"- 切换网络（WiFi → 有线 或 手机热点）\n"
+                    f"- 尝试: curl -v https://nexusai.aihang365.com\n"
+                    f"- 或使用本地后端: gchat -b local"
+                )
+
+            return f"[curl错误 {result.returncode}]: {stderr_msg}\n提示: 请检查网络连接后重试"
+
+        # 解析JSON响应
+        response_data = json.loads(result.stdout)
+
+        # 检查是否有错误
+        if "error" in response_data:
+            error = response_data["error"]
+            error_msg = error.get("message", "")
+            error_type = error.get("type", "")
+            error_code = error.get("code", "")
+
+            # 构建详细错误信息
+            if error_msg:
+                return f"[API错误]: {error_msg}"
+            elif error_type or error_code:
+                return f"[API错误]: {error_type or error_code}\n详情: {json.dumps(error, ensure_ascii=False)}"
+                return f"[API错误]: {json.dumps(error, ensure_ascii=False)}"
+
+        # 返回AI回复
+        return response_data["choices"][0]["message"]["content"]
+
+    except subprocess.TimeoutExpired:
+        return f"[超时]: 请求超过120秒"
+    except json.JSONDecodeError as e:
+        return f"[JSON解析错误]: {str(e)}\n响应: {result.stdout[:200]}"
+    except Exception as e:
+        return f"[错误]: {str(e)}"
+
+def resolve_model(model_input):
+    """解析模型名称"""
+    return MODEL_ALIASES.get(model_input, model_input)
+
+def auto_save_history(messages, model):
+    """自动保存会话历史到当前目录"""
+    if not messages or len(messages) == 0:
+        return  # 没有对话内容，不保存
+
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"gchat_history_{timestamp}.json"
+
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                "model": model,
+                "messages": messages,
+                "timestamp": timestamp
+            }, f, ensure_ascii=False, indent=2)
+        print(colored(f"💾 会话已自动保存到: {filename}", Color.GREEN))
+    except Exception as e:
+        print(colored(f"⚠️  自动保存失败: {e}", Color.RED))
+
+def load_latest_history():
+    """加载当前目录中最新的会话历史"""
+    import glob
+
+    history_files = glob.glob("gchat_history_*.json")
+    if not history_files:
+        return None, None, None
+
+    # 按文件名排序（文件名包含时间戳，自然排序即可）
+    latest_file = sorted(history_files)[-1]
+
+    try:
+        with open(latest_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get("messages", []), data.get("model", "gemini-3-flash-preview"), latest_file
+    except Exception as e:
+        print(colored(f"⚠️  加载会话失败: {e}", Color.RED))
+        return None, None, None
+
+def execute_function(name, args):
+    """执行函数调用（模拟实现）"""
+    if name == "get_weather":
+        city = args.get("city", "未知")
+        # 模拟天气数据
+        return {"city": city, "temperature": "15°C", "condition": "晴", "humidity": "45%"}
+    elif name == "web_search":
+        query = args.get("query", "")
+        return {"results": [f"关于 '{query}' 的搜索结果...", "更多内容请访问搜索引擎"]}
+    elif name == "calculate":
+        expr = args.get("expression", "0")
+        try:
+            # 安全的数学计算
+            import math
+            allowed = {"sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+                      "log": math.log, "exp": math.exp, "abs": abs, "round": round, "pow": pow}
+            result = eval(expr, {"__builtins__": {}}, allowed)
+            return {"expression": expr, "result": result}
+        except Exception as e:
+            return {"error": str(e)}
+    elif name == "run_bash":
+        command = args.get("command", "")
+        try:
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+            return {"command": command, "stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+        except Exception as e:
+            return {"error": str(e)}
+    else:
+        return {"error": f"未知函数: {name}"}
+
+
+def interactive_mode(model, backend_name, continue_session=False):
+    """交互式多轮会话"""
+    backend_config = BACKENDS[backend_name]
+    model = resolve_model(model)
+    messages = []
+    loaded_file = None
+    enabled_tools = []  # 当前启用的工具列表
+
+    # 如果是继续会话模式，尝试加载最近的历史
+    if continue_session:
+        loaded_messages, loaded_model, loaded_file = load_latest_history()
+        if loaded_messages:
+            messages = loaded_messages
+            if loaded_model:
+                model = loaded_model
+            print(colored(f"📂 已加载会话: {loaded_file}", Color.GREEN))
+            print(colored(f"   共 {len(messages)} 条消息 ({len(messages)//2} 轮对话)", Color.GREEN))
+            print()
+
+    print_header()
+    print(f"模型: {colored(model, Color.GREEN)}  后端: {colored(backend_config['name'], Color.BLUE)}")
+    if continue_session and loaded_file:
+        print(f"会话: {colored('继续上次对话', Color.YELLOW)}")
+    else:
+        print(f"会话: {colored('新对话', Color.YELLOW)}")
+    print()
+
+    input_mode = 'normal'  # normal | box
+    history = None
+    if pt_prompt and FileHistory and sys.stdin.isatty():
+        try:
+            history = FileHistory(get_input_history_path())
+        except Exception:
+            history = None
+
+    def prompt_text() -> str:
+        return colored("You[box]> ", Color.BOLD) if input_mode == 'box' else colored("You> ", Color.BOLD)
+
+    def read_user_message(force_box: bool = False, default_text: str = "") -> str | None:
+        """读取用户输入。
+
+        - normal: 单行 Enter 发送；如果内容已包含换行（常见于粘贴），Enter 继续换行，Ctrl+S 发送
+        - box: 多行输入框；Enter 换行，Ctrl+S 发送，Ctrl+G 取消
+        """
+        use_box = force_box or (input_mode == 'box')
+
+        if pt_prompt and KeyBindings and sys.stdin.isatty():
+            kb = KeyBindings()
+            cancel_token = "__CANCEL__"
+
+            @kb.add('c-g')
+            def _(event):
+                event.app.exit(result=cancel_token)
+
+            @kb.add('c-c')
+            def _(event):
+                buf = event.current_buffer
+                if buf.text:
+                    buf.reset()
+                    return
+                event.app.exit(result=cancel_token)
+
+            @kb.add('c-s')
+            def _(event):
+                event.current_buffer.validate_and_handle()
+
+            @kb.add('enter')
+            def _(event):
+                buf = event.current_buffer
+                text = buf.text
+
+                if text.endswith('\\'):
+                    buf.delete_before_cursor(count=1)
+                    buf.insert_text('\n')
+                    return
+
+                if use_box:
+                    buf.insert_text('\n')
+                    return
+
+                if '\n' in text:
+                    buf.insert_text('\n')
+                    return
+
+                buf.validate_and_handle()
+
+            prompt_obj = PTANSI(prompt_text()) if PTANSI else prompt_text()
+            try:
+                text = pt_prompt(
+                    prompt_obj,
+                    default=default_text,
+                    multiline=True,
+                    key_bindings=kb,
+                    history=history,
+                    wrap_lines=True,
+                )
+            except KeyboardInterrupt:
+                return None
+            if text == cancel_token:
+                return None
+            return sanitize_terminal_paste(text)
+
+        prompt = readline_safe_prompt(prompt_text())
+        cont_prompt = readline_safe_prompt(colored("...> ", Color.BOLD))
+
+        if use_box:
+            print(colored("输入框模式：输入多行，单独一行输入 . 结束；空内容取消。", Color.YELLOW))
+            lines: list[str] = []
+            while True:
+                try:
+                    l = input(cont_prompt)
+                except KeyboardInterrupt:
+                    return None
+                if l == '.':
+                    break
+                lines.append(l)
+            text = "\n".join(lines)
+            text = sanitize_terminal_paste(text)
+            return text if text.strip() else None
+
+        try:
+            line = input(prompt)
+        except KeyboardInterrupt:
+            return None
+        lines = []
+        while True:
+            if line.endswith('\\'):
+                lines.append(line[:-1])
+                try:
+                    line = input(cont_prompt)
+                except KeyboardInterrupt:
+                    return None
+                continue
+            lines.append(line)
+            break
+        return sanitize_terminal_paste("\n".join(lines))
+
+    def maybe_confirm_box(text: str) -> str | None:
+        show = (input_mode == 'box') or ('\n' in text) or (len(text) >= 400)
+        if not show:
+            return text
+
+        while True:
+            print_box("内容", text)
+            ans = input("发送？[Enter]=发送, e=编辑, c=取消 > ").strip().lower()
+            if ans in {'', 'y', 'yes'}:
+                return text
+            if ans in {'c', 'cancel', 'n', 'no'}:
+                return None
+            if ans in {'e', 'edit'}:
+                edited = read_user_message(force_box=True, default_text=text)
+                if edited is None:
+                    return None
+                text = edited
+                continue
+
+    while True:
+        try:
+            user_input_raw = read_user_message()
+            if user_input_raw is None:
+                continue
+
+            user_input = user_input_raw.strip()
+
+            if user_input == '/paste':
+                pasted = read_user_message(force_box=True)
+                if pasted is None:
+                    continue
+                user_input = pasted.strip()
+
+
+            if not user_input:
+                continue
+
+            # 处理命令
+            if user_input.startswith('/'):
+                cmd_parts = user_input[1:].split(maxsplit=1)
+                cmd = cmd_parts[0].lower()
+                cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else None
+
+                if cmd in ['quit', 'q', 'exit']:
+                    auto_save_history(messages, model)
+                    print(colored("再见！", Color.CYAN))
+                    break
+                elif cmd in ['help', 'h']:
+                    print_help()
+                elif cmd in ['clear', 'c']:
+                    if messages:
+                        msg_count = len(messages)
+                        round_count = msg_count // 2
+                        print(colored(f"🗑️  已清空 {msg_count} 条消息 ({round_count} 轮对话)", Color.YELLOW))
+                        print(colored("   上下文已重置，开始新的对话", Color.YELLOW))
+                        messages = []
+                    else:
+                        print(colored("对话历史本来就是空的", Color.YELLOW))
+                elif cmd == 'history':
+                    if not messages:
+                        print(colored("对话历史为空", Color.YELLOW))
+                    else:
+                        for i, msg in enumerate(messages):
+                            role = "You" if msg["role"] == "user" else "AI"
+                            content = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+                            print(f"  [{i+1}] {role}: {content}")
+                elif cmd == 'model':
+                    if cmd_arg:
+                        model = resolve_model(cmd_arg)
+                        print(colored(f"模型已切换到: {model}", Color.GREEN))
+                    else:
+                        print(f"当前模型: {model}")
+                        print(f"可用模型: flash, pro, pro3")
+                elif cmd == 'backend':
+                    if cmd_arg and cmd_arg in BACKENDS:
+                        backend_name = cmd_arg
+                        backend_config = BACKENDS[backend_name]
+                        print(colored(f"后端已切换到: {backend_config['name']}", Color.GREEN))
+                    else:
+                        print(f"当前后端: {backend_config['name']}")
+                        print(f"可用后端: {', '.join(BACKENDS.keys())}")
+                elif cmd == 'status':
+                    print(f"模型: {model}")
+                    print(f"后端: {backend_config['name']}")
+                    print(f"对话轮数: {len(messages) // 2}")
+                    if enabled_tools:
+                        print(f"启用工具: {', '.join([t['name'] for t in enabled_tools])}")
+                        print(colored("  💡 启用工具时会自动使用官方API", Color.YELLOW))
+                    else:
+                        print(f"启用工具: 无")
+                elif cmd == 'tools':
+                    if not cmd_arg:
+                        # 列出当前启用的工具
+                        if enabled_tools:
+                            print(colored("当前启用的工具:", Color.GREEN))
+                            for t in enabled_tools:
+                                print(f"  🔧 {t['name']}: {t['description']}")
+                        else:
+                            print(colored("当前没有启用任何工具", Color.YELLOW))
+                            print("使用 /tools add <name> 添加工具，可用: " + ", ".join(BUILTIN_TOOLS.keys()))
+                    else:
+                        parts = cmd_arg.split(maxsplit=1)
+                        subcmd = parts[0].lower()
+                        subarg = parts[1] if len(parts) > 1 else None
+
+                        if subcmd == 'list':
+                            print(colored("可用工具:", Color.GREEN))
+                            for name, tool in BUILTIN_TOOLS.items():
+                                status = "✅" if any(t['name'] == tool['name'] for t in enabled_tools) else "  "
+                                print(f"  {status} {name}: {tool['description']}")
+                        elif subcmd == 'add':
+                            if subarg and subarg in BUILTIN_TOOLS:
+                                tool = BUILTIN_TOOLS[subarg]
+                                if not any(t['name'] == tool['name'] for t in enabled_tools):
+                                    enabled_tools.append(tool)
+                                    print(colored(f"✅ 已添加工具: {tool['name']}", Color.GREEN))
+                                    print(colored("   💡 启用工具后会自动使用官方API进行Function Calling", Color.YELLOW))
+                                else:
+                                    print(colored(f"工具 {subarg} 已经启用", Color.YELLOW))
+                            else:
+                                print(f"未知工具: {subarg}")
+                                print("可用工具: " + ", ".join(BUILTIN_TOOLS.keys()))
+                        elif subcmd == 'remove':
+                            if subarg:
+                                tool = BUILTIN_TOOLS.get(subarg)
+                                if tool:
+                                    enabled_tools = [t for t in enabled_tools if t['name'] != tool['name']]
+                                    print(colored(f"❌ 已移除工具: {tool['name']}", Color.YELLOW))
+                                else:
+                                    print(f"未知工具: {subarg}")
+                            else:
+                                print("用法: /tools remove <name>")
+                        elif subcmd == 'clear':
+                            enabled_tools = []
+                            print(colored("已清空所有工具", Color.YELLOW))
+                        else:
+                            print(f"未知子命令: {subcmd}")
+                            print("用法: /tools [list|add|remove|clear]")
+                elif cmd == 'call':
+                    # 强制使用官方API进行Function Calling
+                    if not cmd_arg:
+                        print("用法: /call <提示词>")
+                        continue
+
+                    if not enabled_tools:
+                        print(colored("⚠️  没有启用任何工具，请先使用 /tools add <name> 添加工具", Color.YELLOW))
+                        continue
+
+                    print(colored(f"🔧 使用官方API进行Function Calling...", Color.CYAN))
+                    messages.append({"role": "user", "content": cmd_arg})
+
+                    result, error = official_api_request(messages, model, enabled_tools)
+                    if error:
+                        print(colored(error, Color.RED))
+                        messages.pop()  # 移除失败的消息
+                        continue
+
+                    if result["type"] == "function_call":
+                        fc_name = result["name"]
+                        fc_args = result["args"]
+                        print(colored(f"📞 函数调用: {fc_name}({json.dumps(fc_args, ensure_ascii=False)})", Color.YELLOW))
+
+                        # 执行函数
+                        fc_result = execute_function(fc_name, fc_args)
+                        print(colored(f"📤 函数结果: {json.dumps(fc_result, ensure_ascii=False)}", Color.GREEN))
+
+                        # 记录到历史
+                        messages.append({"role": "assistant", "content": f"[调用函数 {fc_name}]\n参数: {json.dumps(fc_args, ensure_ascii=False)}\n结果: {json.dumps(fc_result, ensure_ascii=False)}"})
+                    else:
+                        print(colored("AI>", Color.CYAN))
+                        print(result["content"])
+                        messages.append({"role": "assistant", "content": result["content"]})
+                    print()
+                elif cmd == 'save':
+                    if cmd_arg:
+                        try:
+                            with open(cmd_arg, 'w', encoding='utf-8') as f:
+                                json.dump({"model": model, "messages": messages}, f, ensure_ascii=False, indent=2)
+                            print(colored(f"对话已保存到: {cmd_arg}", Color.GREEN))
+                        except Exception as e:
+                            print(colored(f"保存失败: {e}", Color.RED))
+                    else:
+                        print("用法: /save <文件名>")
+                elif cmd == 'load':
+                    if cmd_arg:
+                        try:
+                            with open(cmd_arg, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                                messages = data.get("messages", [])
+                                model = data.get("model", model)
+                            print(colored(f"对话已加载，共 {len(messages)} 条消息", Color.GREEN))
+                        except Exception as e:
+                            print(colored(f"加载失败: {e}", Color.RED))
+                    else:
+                        print("用法: /load <文件名>")
+                elif cmd == 'mode':
+                    if not cmd_arg:
+                        input_mode = 'box' if input_mode == 'normal' else 'normal'
+                    else:
+                        arg = cmd_arg.strip().lower()
+                        if arg in {'normal', 'n'}:
+                            input_mode = 'normal'
+                        elif arg in {'box', 'b'}:
+                            input_mode = 'box'
+                        else:
+                            print(colored("用法: /mode [normal|box]", Color.YELLOW))
+                            continue
+                    print(colored(f"输入模式已切换到: {input_mode}", Color.GREEN))
+                elif cmd in {'img', 'image'}:
+                    try:
+                        parts = shlex.split(user_input, posix=True)
+                    except ValueError as e:
+                        print(colored(f"参数解析失败: {e}", Color.RED))
+                        continue
+
+                    args = parts[1:]
+                    if not args:
+                        print(colored("用法: /img <图片路径...> [描述文本]", Color.YELLOW))
+                        continue
+
+                    image_paths: list[Path] = []
+                    text_parts: list[str] = []
+                    for tok in args:
+                        p = Path(tok).expanduser()
+                        if is_image_file(p):
+                            image_paths.append(p)
+                        else:
+                            text_parts.append(tok)
+
+                    if not image_paths:
+                        print(colored("未检测到有效图片文件（支持 png/jpg/jpeg/webp/gif 等）", Color.YELLOW))
+                        continue
+
+                    user_text = " ".join(text_parts).strip() or "请描述这张图片。"
+                    confirmed_text = maybe_confirm_box(user_text)
+                    if confirmed_text is None:
+                        continue
+
+                    user_message = {
+                        "role": "user",
+                        "content": [{"type": "text", "text": confirmed_text}] + [
+                            {"type": "image_file", "path": str(p)} for p in image_paths
+                        ],
+                    }
+                    messages.append(user_message)
+
+                    print(colored("AI>", Color.CYAN))
+                    response = chat_request(messages, model, backend_config)
+                    print(response)
+                    print()
+                    messages.append({"role": "assistant", "content": response})
+                else:
+                    print(colored(f"未知命令: /{cmd}，输入 /help 查看帮助", Color.RED))
+                continue
+
+            # 图片：支持直接拖拽图片路径到输入框
+            cleaned_text, image_paths = extract_local_image_paths(user_input)
+            if image_paths:
+                user_text = cleaned_text or "请描述这张图片。"
+                confirmed_text = maybe_confirm_box(user_text)
+                if confirmed_text is None:
+                    continue
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": confirmed_text}] + [
+                        {"type": "image_file", "path": str(p)} for p in image_paths
+                    ],
+                })
+            else:
+                confirmed_text = maybe_confirm_box(user_input)
+                if confirmed_text is None:
+                    continue
+                messages.append({"role": "user", "content": confirmed_text})
+
+            # 发送请求 - 混合路由逻辑
+            print(colored("AI>", Color.CYAN))
+
+            if enabled_tools:
+                # 有工具时使用官方API
+                result, error = official_api_request(messages, model, enabled_tools)
+                if error:
+                    print(colored(error, Color.RED))
+                    messages.pop()  # 移除失败的消息
+                    continue
+
+                if result["type"] == "function_call":
+                    fc_name = result["name"]
+                    fc_args = result["args"]
+                    print(colored(f"📞 函数调用: {fc_name}({json.dumps(fc_args, ensure_ascii=False)})", Color.YELLOW))
+
+                    # 执行函数
+                    fc_result = execute_function(fc_name, fc_args)
+                    print(colored(f"📤 函数结果: {json.dumps(fc_result, ensure_ascii=False)}", Color.GREEN))
+
+                    # 记录到历史
+                    response = f"[调用函数 {fc_name}]\n参数: {json.dumps(fc_args, ensure_ascii=False)}\n结果: {json.dumps(fc_result, ensure_ascii=False)}"
+                else:
+                    response = result["content"]
+                    print(response)
+            else:
+                # 无工具时使用逆向API
+                response = chat_request(messages, model, backend_config)
+                print(response)
+
+            print()
+
+            # 添加AI回复到历史
+            messages.append({"role": "assistant", "content": response})
+
+        except KeyboardInterrupt:
+            print("\n" + colored("(使用 /quit 退出)", Color.YELLOW))
+        except EOFError:
+            print()
+            auto_save_history(messages, model)
+            print(colored("再见！", Color.CYAN))
+            break
+
+def single_prompt(prompt, model, backend_name):
+    """单次提问模式"""
+    backend_config = BACKENDS[backend_name]
+    model = resolve_model(model)
+    messages = [{"role": "user", "content": prompt}]
+    response = chat_request(messages, model, backend_config)
+    print(response)
+
+def list_models():
+    """列出可用模型"""
+    print("可用模型:")
+    print("  flash   -> gemini-3-flash-preview (最新 3.0 Flash) ⭐ 推荐")
+    print("  flash3  -> gemini-3-flash-preview (同上)")
+    print("  flash2  -> gemini-2.5-flash (旧版 Flash)")
+    print("  pro     -> gemini-2.5-pro (Pro)")
+    print("  pro3    -> gemini-3.0-pro (3.0 Pro)")
+    print()
+    print("可用后端:")
+    for name, config in BACKENDS.items():
+        tools_support = "✅ 支持Function Calling" if config.get("supports_tools") else ""
+        print(f"  {name:8} -> {config['name']} {tools_support}")
+    print()
+    print("可用工具 (用于Function Calling):")
+    for name, tool in BUILTIN_TOOLS.items():
+        print(f"  {name:12} -> {tool['description']}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Gemini Chat CLI - 多轮会话命令行工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  gchat                    开启新对话
+  gchat -c                 继续上次对话（自动加载最近会话）
+  gchat -m pro             使用pro模型
+  gchat -p "解释量子计算"   单次提问
+  gchat --backend nexus    使用NexusAI后端
+        """
+    )
+
+    parser.add_argument('-m', '--model', default='flash',
+                        help='模型名称 (flash/pro/pro3，默认: flash)')
+    parser.add_argument('-p', '--prompt',
+                        help='单次提问（不进入交互模式）')
+    parser.add_argument('-c', '--continue', dest='continue_session', action='store_true',
+                        help='继续上次会话（自动加载最近的历史记录）')
+    parser.add_argument('-b', '--backend', default='nexus',
+                        choices=BACKENDS.keys(),
+                        help='后端选择 (默认: nexus)')
+    parser.add_argument('--list-models', action='store_true',
+                        help='列出可用模型和后端')
+
+    args = parser.parse_args()
+
+    if args.list_models:
+        list_models()
+        return
+
+    if args.prompt:
+        single_prompt(args.prompt, args.model, args.backend)
+    else:
+        interactive_mode(args.model, args.backend, continue_session=args.continue_session)
+
+if __name__ == "__main__":
+    main()
