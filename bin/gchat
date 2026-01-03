@@ -4,9 +4,9 @@ Gemini Chat CLI - 多轮会话命令行工具
 支持多种后端：本地Gemini Reverse API、NexusAI等
 
 用法:
-    gchat                    # 交互式多轮会话（默认flash模型）
-    gchat -m pro             # 使用pro模型
-    gchat -m pro3            # 使用gemini-3.0-pro模型
+    gchat                    # 交互式多轮会话（默认 gemini-3-pro-preview）
+    gflashchat               # 使用 gemini-3-flash-preview
+    gchat -m flash3          # 使用 flash3 模型
     gchat -p "你好"          # 单次提问
     gchat --backend nexus    # 使用NexusAI后端
     gchat --list-models      # 列出可用模型
@@ -61,6 +61,11 @@ except Exception:
 
 # 后端配置
 BACKENDS = {
+    "google": {
+        "url": "https://google-api.aihang365.com/v1/chat/completions",
+        "name": "Google API (内部服务，无需Key)",
+        "supports_tools": False,
+    },
     "local": {
         "url": "http://82.29.54.80:8100/v1/chat/completions",
         "name": "Gemini Reverse API (本地)",
@@ -91,12 +96,18 @@ OFFICIAL_MODEL_MAP = {
 
 # 模型别名
 MODEL_ALIASES = {
-    "flash": "gemini-3-flash-preview",  # 默认使用最新 3.0 Flash
-    "flash3": "gemini-3-flash-preview",
+    "pro3": "gemini-3-pro-preview",  # ⭐ gchat 默认
+    "flash3": "gemini-3-flash-preview",  # gflashchat 默认
+    "flash": "gemini-3-flash-preview",
     "flash2": "gemini-2.5-flash",  # 旧版 Flash
     "pro": "gemini-2.5-pro",
-    "pro3": "gemini-3.0-pro",
     "3": "gemini-3.0-pro",
+}
+
+# 模型降级映射 (gemini-3 失败时降级到 gemini-2.5)
+FALLBACK_MODELS = {
+    "gemini-3-pro-preview": "gemini-2.5-pro",
+    "gemini-3-flash-preview": "gemini-2.5-flash",
 }
 
 # 预定义的常用工具
@@ -558,6 +569,22 @@ def resolve_model(model_input):
     """解析模型名称"""
     return MODEL_ALIASES.get(model_input, model_input)
 
+
+def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=False):
+    """发送聊天请求，失败时自动降级到备用模型"""
+    # 第一次尝试：使用主模型
+    response = chat_request(messages, model, backend_config, retry=retry, debug=debug)
+
+    # 检查是否失败（错误响应以 [ 开头）
+    if response.startswith("[") and model in FALLBACK_MODELS:
+        fallback_model = FALLBACK_MODELS[model]
+        print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
+        response = chat_request(messages, fallback_model, backend_config, retry=retry, debug=debug)
+        if not response.startswith("["):
+            print(f"✅ 降级成功，使用 {fallback_model} 响应\n")
+
+    return response
+
 def auto_save_history(messages, model):
     """自动保存会话历史到当前目录"""
     if not messages or len(messages) == 0:
@@ -1012,7 +1039,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                     messages.append(user_message)
 
                     print(colored("AI>", Color.CYAN))
-                    response = chat_request(messages, model, backend_config)
+                    response = chat_request_with_fallback(messages, model, backend_config)
                     print(response)
                     print()
                     messages.append({"role": "assistant", "content": response})
@@ -1066,7 +1093,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                     print(response)
             else:
                 # 无工具时使用逆向API
-                response = chat_request(messages, model, backend_config)
+                response = chat_request_with_fallback(messages, model, backend_config)
                 print(response)
 
             print()
@@ -1087,7 +1114,7 @@ def single_prompt(prompt, model, backend_name):
     backend_config = BACKENDS[backend_name]
     model = resolve_model(model)
     messages = [{"role": "user", "content": prompt}]
-    response = chat_request(messages, model, backend_config)
+    response = chat_request_with_fallback(messages, model, backend_config)
     print(response)
 
 def list_models():
@@ -1122,15 +1149,15 @@ def main():
         """
     )
 
-    parser.add_argument('-m', '--model', default='flash',
-                        help='模型名称 (flash/pro/pro3，默认: flash)')
+    parser.add_argument('-m', '--model', default='pro3',
+                        help='模型名称 (pro3/flash3/pro/flash，默认: pro3)')
     parser.add_argument('-p', '--prompt',
                         help='单次提问（不进入交互模式）')
     parser.add_argument('-c', '--continue', dest='continue_session', action='store_true',
                         help='继续上次会话（自动加载最近的历史记录）')
-    parser.add_argument('-b', '--backend', default='nexus',
+    parser.add_argument('-b', '--backend', default='google',
                         choices=BACKENDS.keys(),
-                        help='后端选择 (默认: nexus)')
+                        help='后端选择 (默认: google)')
     parser.add_argument('--list-models', action='store_true',
                         help='列出可用模型和后端')
 

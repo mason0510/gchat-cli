@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""
+Gemini Flash Chat CLI - 使用 gemini-3-flash-preview 的快速对话工具
+这是 gchat -m flash3 的快捷方式
+
+用法:
+    gflashchat               # 交互式多轮会话
+    gflashchat -p "你好"     # 单次提问
+"""
+
+import sys
+import os
+
+# 获取 gchat 的路径
+script_dir = os.path.dirname(os.path.abspath(__file__))
+gchat_path = os.path.join(script_dir, 'gchat')
+
+# 插入 -m flash3 参数
+args = [gchat_path, '-m', 'flash3'] + sys.argv[1:]
+
+# 执行 gchat
+os.execv(sys.executable, [sys.executable] + args)

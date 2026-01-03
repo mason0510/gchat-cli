@@ -39,7 +39,12 @@ echo "📦 安装 gchat..."
 cp bin/gchat "$INSTALL_DIR/gchat"
 chmod +x "$INSTALL_DIR/gchat"
 
+echo "📦 安装 gflashchat..."
+cp bin/gflashchat "$INSTALL_DIR/gflashchat"
+chmod +x "$INSTALL_DIR/gflashchat"
+
 echo "✅ gchat 已安装到: $INSTALL_DIR/gchat"
+echo "✅ gflashchat 已安装到: $INSTALL_DIR/gflashchat"
 echo ""
 
 # 检查PATH
@@ -74,7 +79,8 @@ if "$INSTALL_DIR/gchat" --help > /dev/null 2>&1; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "快速开始："
-    echo "  gchat              # 交互式对话"
+    echo "  gchat              # 交互式对话 (gemini-3-pro-preview)"
+    echo "  gflashchat         # 快速对话 (gemini-3-flash-preview)"
     echo "  gchat -c           # 继续上次对话"
     echo "  gchat -p \"问题\"   # 单次提问"
     echo "  gchat --help       # 查看帮助"
