@@ -63,8 +63,8 @@ except Exception:
 BACKENDS = {
     "google": {
         "url": "https://google-api.aihang365.com/v1/chat/completions",
-        "name": "Google API (内部服务，无需Key)",
-        "supports_tools": False,
+        "name": "Google API (内部服务，支持Function Calling)",
+        "supports_tools": True,
     },
     "local": {
         "url": "http://82.29.54.80:8100/v1/chat/completions",
@@ -480,6 +480,74 @@ def official_api_request(messages, model, tools=None, api_key=None):
         return None, f"[错误]: {e}"
 
 
+def openai_tools_request(messages, model, tools, backend_config, retry=2):
+    """发送带工具的请求（OpenAI 格式，用于 google 后端）"""
+    url = backend_config["url"]
+
+    # 转换工具格式
+    openai_tools = []
+    for tool in tools:
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {"type": "object", "properties": {}})
+            }
+        })
+
+    payload = {
+        "model": model,
+        "messages": normalize_messages_for_api(messages),
+        "tools": openai_tools
+    }
+
+    curl_cmd = [
+        'curl', '-s', '-X', 'POST', url,
+        '-H', 'Content-Type: application/json',
+        '--max-time', '120',
+        '-d', json.dumps(payload)
+    ]
+
+    try:
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=125)
+
+        if result.returncode != 0:
+            return None, f"[curl错误 {result.returncode}]: {result.stderr}"
+
+        response_data = json.loads(result.stdout)
+
+        if "error" in response_data:
+            return None, f"[API错误]: {response_data['error'].get('message', str(response_data['error']))}"
+
+        choice = response_data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+
+        # 检查是否有工具调用
+        if "tool_calls" in message and message["tool_calls"]:
+            tc = message["tool_calls"][0]
+            func = tc.get("function", {})
+            return {
+                "type": "function_call",
+                "name": func.get("name"),
+                "args": json.loads(func.get("arguments", "{}"))
+            }, None
+
+        # 普通文本响应
+        content = message.get("content", "")
+        if content:
+            return {"type": "text", "content": content}, None
+
+        return None, "[错误] 无法解析响应"
+
+    except subprocess.TimeoutExpired:
+        return None, "[超时]: 请求超过120秒"
+    except json.JSONDecodeError as e:
+        return None, f"[JSON解析错误]: {e}\n响应: {result.stdout[:300]}"
+    except Exception as e:
+        return None, f"[错误]: {e}"
+
+
 def chat_request(messages, model, backend_config, retry=2, debug=False):
     """发送聊天请求（使用curl，兼容性最好）"""
     url = backend_config["url"]
@@ -879,7 +947,10 @@ def interactive_mode(model, backend_name, continue_session=False):
                     print(f"对话轮数: {len(messages) // 2}")
                     if enabled_tools:
                         print(f"启用工具: {', '.join([t['name'] for t in enabled_tools])}")
-                        print(colored("  💡 启用工具时会自动使用官方API", Color.YELLOW))
+                        if backend_config.get("supports_tools"):
+                            print(colored("  💡 当前后端支持 Function Calling", Color.GREEN))
+                        else:
+                            print(colored("  ⚠️  当前后端不支持工具调用，请切换到 google 后端", Color.YELLOW))
                     else:
                         print(f"启用工具: 无")
                 elif cmd == 'tools':
@@ -1069,9 +1140,15 @@ def interactive_mode(model, backend_name, continue_session=False):
             # 发送请求 - 混合路由逻辑
             print(colored("AI>", Color.CYAN))
 
-            if enabled_tools:
-                # 有工具时使用官方API
-                result, error = official_api_request(messages, model, enabled_tools)
+            if enabled_tools and backend_config.get("supports_tools"):
+                # 有工具且后端支持时，使用工具调用
+                if backend_name == "google":
+                    # google 后端使用 OpenAI 格式
+                    result, error = openai_tools_request(messages, model, enabled_tools, backend_config)
+                else:
+                    # official 后端使用 Gemini 原生格式
+                    result, error = official_api_request(messages, model, enabled_tools)
+
                 if error:
                     print(colored(error, Color.RED))
                     messages.pop()  # 移除失败的消息
@@ -1092,7 +1169,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                     response = result["content"]
                     print(response)
             else:
-                # 无工具时使用逆向API
+                # 无工具或后端不支持时使用普通请求
                 response = chat_request_with_fallback(messages, model, backend_config)
                 print(response)
 
