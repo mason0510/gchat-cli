@@ -844,6 +844,7 @@ def print_help():
             ("/model <name>", "switch model (flash/pro/pro3)"),
             ("/backend <name>", "switch backend"),
             ("/stream", "toggle streaming"),
+            ("/spinner", "toggle spinner animation"),
             ("/mode [box]", "toggle input mode"),
             ("/prefs [edit]", "manage preferences (GCHAT.md)"),
             ("/status", "show current status"),
@@ -1235,14 +1236,14 @@ def chat_request_stream(messages, model, backend_config, debug=False, show_spinn
             spinner.stop()
 
 
-def chat_request_with_fallback_stream(messages, model, backend_config, debug=False):
+def chat_request_with_fallback_stream(messages, model, backend_config, debug=False, show_spinner=True):
     """流式请求，失败时降级"""
-    response = chat_request_stream(messages, model, backend_config, debug=debug)
+    response = chat_request_stream(messages, model, backend_config, debug=debug, show_spinner=show_spinner)
 
     if response.startswith("[") and model in FALLBACK_MODELS:
         fallback_model = FALLBACK_MODELS[model]
         print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
-        response = chat_request_stream(messages, fallback_model, backend_config, debug=debug)
+        response = chat_request_stream(messages, fallback_model, backend_config, debug=debug, show_spinner=show_spinner)
 
     return response
 
@@ -1420,6 +1421,7 @@ def interactive_mode(model, backend_name, continue_session=False):
     # 用户可通过 /tools add read 手动启用
     enabled_tools = []
     use_stream = True   # 默认启用流式输出
+    show_spinner = False  # 默认不显示 spinner
 
     # 加载用户偏好 (GCHAT.md) 作为系统提示
     preferences = load_preferences()
@@ -1669,9 +1671,10 @@ def interactive_mode(model, backend_name, continue_session=False):
                 elif cmd == 'status':
                     turns = len(messages) // 2
                     stream_status = "on" if use_stream else "off"
+                    spinner_status = "on" if show_spinner else "off"
                     tools_status = ', '.join([t['name'] for t in enabled_tools]) if enabled_tools else "-"
                     prefs_status = "on" if preferences else "off"
-                    print(colored(f"  {model}  ·  {turns} turns  ·  stream {stream_status}  ·  prefs {prefs_status}", Color.DIM))
+                    print(colored(f"  {model}  ·  {turns} turns  ·  stream {stream_status}  ·  spinner {spinner_status}  ·  prefs {prefs_status}", Color.DIM))
                 elif cmd in {'prefs', 'preferences'}:
                     # 管理偏好文件
                     prefs_path = get_preferences_path()
@@ -1758,7 +1761,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                     messages.append(user_message)
                     print()  # AI response follows
                     if use_stream:
-                        response = chat_request_with_fallback_stream(messages, model, backend_config)
+                        response = chat_request_with_fallback_stream(messages, model, backend_config, show_spinner=show_spinner)
                     else:
                         response = chat_request_with_fallback(messages, model, backend_config)
                         print(response)
@@ -1790,6 +1793,10 @@ def interactive_mode(model, backend_name, continue_session=False):
                     # 切换流式输出
                     use_stream = not use_stream
                     print(colored(f"→ stream {'on' if use_stream else 'off'}", Color.GREEN))
+                elif cmd == 'spinner':
+                    # 切换 spinner 动画
+                    show_spinner = not show_spinner
+                    print(colored(f"→ spinner {'on' if show_spinner else 'off'}", Color.GREEN))
                 elif cmd == 'tools':
                     if not cmd_arg:
                         # 列出当前启用的工具
@@ -2009,7 +2016,7 @@ def interactive_mode(model, backend_name, continue_session=False):
             else:
                 # 无工具或后端不支持时使用普通请求
                 if use_stream:
-                    response = chat_request_with_fallback_stream(messages, model, backend_config)
+                    response = chat_request_with_fallback_stream(messages, model, backend_config, show_spinner=show_spinner)
                 else:
                     response = chat_request_with_fallback(messages, model, backend_config)
                     print(response)
@@ -2117,7 +2124,7 @@ def main():
     if args.prompt:
         single_prompt(args.prompt, args.model, args.backend,
                      output_json=args.output_json,
-                     use_stream=not args.no_stream)
+                     use_stream=False)
     else:
         interactive_mode(args.model, args.backend, continue_session=args.continue_session)
 
