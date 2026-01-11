@@ -201,9 +201,21 @@ def readline_safe_prompt(prompt: str) -> str:
     return ANSI_ESCAPE_RE.sub(_wrap, prompt)
 
 
-def get_input_history_path() -> str:
+def get_gchat_dir() -> str:
+    """获取gchat数据目录，不存在则创建"""
     home = os.path.expanduser('~')
-    return os.path.join(home, '.gchat_input_history')
+    gchat_dir = os.path.join(home, '.gchat')
+    os.makedirs(gchat_dir, exist_ok=True)
+    return gchat_dir
+
+def get_sessions_dir() -> str:
+    """获取会话历史目录"""
+    sessions_dir = os.path.join(get_gchat_dir(), 'sessions')
+    os.makedirs(sessions_dir, exist_ok=True)
+    return sessions_dir
+
+def get_input_history_path() -> str:
+    return os.path.join(get_gchat_dir(), 'input_history')
 
 
 def print_box(title: str, content: str) -> None:
@@ -401,7 +413,7 @@ def print_help():
   box:    多行输入框；Enter 换行；Ctrl+S 发送；Ctrl+G 取消
 
 自动保存:
-  退出时会自动保存会话到: gchat_history_YYYYMMDD_HHMMSS.json
+  退出时会自动保存会话到: ~/.gchat/sessions/gchat_history_YYYYMMDD_HHMMSS.json
 """
     print(colored(help_text, Color.YELLOW))
 
@@ -632,6 +644,7 @@ def chat_request(messages, model, backend_config, retry=2, debug=False):
                 return f"[API错误]: {error_msg}"
             elif error_type or error_code:
                 return f"[API错误]: {error_type or error_code}\n详情: {json.dumps(error, ensure_ascii=False)}"
+            else:
                 return f"[API错误]: {json.dumps(error, ensure_ascii=False)}"
 
         # 返回AI回复
@@ -665,13 +678,13 @@ def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=F
     return response
 
 def auto_save_history(messages, model):
-    """自动保存会话历史到当前目录"""
+    """自动保存会话历史到 ~/.gchat/sessions/"""
     if not messages or len(messages) == 0:
         return  # 没有对话内容，不保存
 
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"gchat_history_{timestamp}.json"
+    filename = os.path.join(get_sessions_dir(), f"gchat_history_{timestamp}.json")
 
     try:
         with open(filename, 'w', encoding='utf-8') as f:
@@ -685,10 +698,11 @@ def auto_save_history(messages, model):
         print(colored(f"⚠️  自动保存失败: {e}", Color.RED))
 
 def load_latest_history():
-    """加载当前目录中最新的会话历史"""
+    """加载最新的会话历史"""
     import glob
 
-    history_files = glob.glob("gchat_history_*.json")
+    sessions_dir = get_sessions_dir()
+    history_files = glob.glob(os.path.join(sessions_dir, "gchat_history_*.json"))
     if not history_files:
         return None, None, None
 

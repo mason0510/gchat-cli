@@ -1,0 +1,16 @@
+# 旧版会话文件（现已迁移到 ~/.gchat/sessions/）
+gchat_history_*.json
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
