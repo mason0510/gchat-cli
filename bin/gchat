@@ -25,6 +25,8 @@ import shlex
 import shutil
 import signal
 import glob as glob_module
+import threading
+import time
 from pathlib import Path
 
 from wcwidth import wcswidth, wcwidth
@@ -361,6 +363,55 @@ def normalize_messages_for_api(messages: list[dict]) -> list[dict]:
 
     return out
 
+
+class StatusSpinner:
+    """请求状态显示器 - Claude Code 风格"""
+    WORDS = ["Thinking", "Processing", "Generating", "Working"]
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self._start_time = 0
+        self._char_idx = 0
+        self._word_idx = 0
+
+    def _animate(self):
+        chars = ["·", ":", "·"]
+        while not self._stop.is_set():
+            elapsed = int(time.time() - self._start_time)
+            if elapsed < 60:
+                time_str = f"{elapsed}s"
+            else:
+                time_str = f"{elapsed // 60}m {elapsed % 60}s"
+
+            word = self.WORDS[self._word_idx % len(self.WORDS)]
+            char = chars[self._char_idx % len(chars)]
+
+            status = f"\r\033[K{colored('*', Color.YELLOW)} {word}{char * 3} {colored(f'(ctrl+c to interrupt · {time_str})', Color.DIM)}"
+            sys.stdout.write(status)
+            sys.stdout.flush()
+
+            self._char_idx += 1
+            if self._char_idx % 10 == 0:
+                self._word_idx += 1
+            self._stop.wait(0.15)
+
+    def start(self):
+        self._start_time = time.time()
+        self._stop.clear()
+        self._char_idx = 0
+        self._word_idx = 0
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+
 def print_header():
     """打印欢迎信息"""
     print(colored("  gchat", Color.BOLD + Color.MAGENTA) + colored(" v5.0", Color.DIM))
@@ -668,7 +719,7 @@ def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=F
     return response
 
 
-def chat_request_stream(messages, model, backend_config, debug=False):
+def chat_request_stream(messages, model, backend_config, debug=False, show_spinner=True):
     """流式发送聊天请求，兼容 SSE 流和完整 JSON 响应"""
     url = backend_config["url"]
     payload = {
@@ -695,7 +746,12 @@ def chat_request_stream(messages, model, backend_config, debug=False):
 
     curl_cmd.extend(['-d', json.dumps(payload)])
 
+    spinner = StatusSpinner() if show_spinner else None
+
     try:
+        if spinner:
+            spinner.start()
+
         process = subprocess.Popen(
             curl_cmd,
             stdout=subprocess.PIPE,
@@ -706,6 +762,7 @@ def chat_request_stream(messages, model, backend_config, debug=False):
 
         full_response = ""
         raw_output = ""
+        first_content = True
 
         for line in process.stdout:
             raw_output += line
@@ -724,6 +781,9 @@ def chat_request_stream(messages, model, backend_config, debug=False):
                         delta = chunk["choices"][0].get("delta", {})
                         content = delta.get("content", "")
                         if content:
+                            if first_content and spinner:
+                                spinner.stop()
+                                first_content = False
                             print(content, end="", flush=True)
                             full_response += content
                 except json.JSONDecodeError:
@@ -733,6 +793,8 @@ def chat_request_stream(messages, model, backend_config, debug=False):
 
         # 如果没有 SSE 流数据，尝试解析完整 JSON
         if not full_response and raw_output.strip():
+            if spinner:
+                spinner.stop()
             try:
                 result = json.loads(raw_output.strip())
                 if "choices" in result and result["choices"]:
@@ -748,7 +810,12 @@ def chat_request_stream(messages, model, backend_config, debug=False):
         return full_response if full_response else "[无响应]"
 
     except Exception as e:
+        if spinner:
+            spinner.stop()
         return f"[流式请求错误]: {str(e)}"
+    finally:
+        if spinner and first_content:  # spinner 还在运行
+            spinner.stop()
 
 
 def chat_request_with_fallback_stream(messages, model, backend_config, debug=False):
