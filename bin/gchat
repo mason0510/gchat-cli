@@ -361,61 +361,57 @@ def normalize_messages_for_api(messages: list[dict]) -> list[dict]:
     return out
 
 def print_header():
-    """打印欢迎信息 - 现代极简风格"""
-    # 1. 品牌层 (Brand & Version)
-    print(colored("✦ NexusAI CLI", Color.BOLD + Color.CYAN) + colored(" v4.0", Color.DIM))
-    print()
-
-    # 2. 状态层 (Status Context) - 由调用方动态填充
-    # print(colored("○", Color.DIM) + " Status: " + colored("Ready to chat", Color.GREEN))
-    # print(colored("○", Color.DIM) + " Mode:   Default" + colored(" (Multi-line: /paste)", Color.DIM))
-    # print(colored("○", Color.DIM) + " Back:   Google API" + colored(" (Functional)", Color.DIM))
-    # print()
-
-    # 3. 引导层 (Hints)
-    print(colored("Type", Color.DIM) + " /help " + colored("for commands or", Color.DIM) + " /quit " + colored("to exit.", Color.DIM))
+    """打印欢迎信息 - Claude Code 风格"""
+    # 品牌层
+    print(colored("╭─", Color.DIM) + colored(" gchat", Color.BOLD + Color.MAGENTA) + colored(" v5.0", Color.DIM))
+    print(colored("│", Color.DIM))
+    # 引导层
+    print(colored("│", Color.DIM) + colored("  /help", Color.CYAN) + colored(" commands  ", Color.DIM) + colored("/quit", Color.CYAN) + colored(" exit", Color.DIM))
+    print(colored("╰─", Color.DIM))
 
     # 分隔线
     print(colored("—", Color.DIM))
 
 def print_help():
-    """打印帮助信息"""
-    help_text = """
-基础命令:
-  /help, /h      显示帮助
-  /quit, /q      退出程序（自动保存）
-  /clear, /c     清空对话历史
-  /history       显示对话历史
-  /status        显示当前状态
+    """打印帮助信息 - Claude Code 风格"""
+    sections = [
+        ("Commands", [
+            ("/help", "show help"),
+            ("/quit", "exit (auto-save)"),
+            ("/clear", "clear chat history"),
+            ("/history", "show chat history"),
+        ]),
+        ("Files", [
+            ("/read <file>", "read file for AI analysis"),
+            ("/write <file>", "save last AI reply to file"),
+            ("/img <path>", "analyze image"),
+        ]),
+        ("Sessions", [
+            ("/sessions", "list saved sessions"),
+            ("/save <file>", "save chat manually"),
+            ("/load <file>", "load chat"),
+        ]),
+        ("Settings", [
+            ("/model <name>", "switch model (flash/pro/pro3)"),
+            ("/backend <name>", "switch backend"),
+            ("/stream", "toggle streaming"),
+            ("/mode [box]", "toggle input mode"),
+        ]),
+    ]
 
-📁 文件操作:
-  /read <file>   读取文件让 AI 分析
-  /write <file>  保存最后一条 AI 回复到文件
-  /img <path>    分析图片
+    print()
+    for section_name, items in sections:
+        print(colored(f"  {section_name}", Color.BOLD))
+        for cmd, desc in items:
+            print(colored(f"    {cmd:<18}", Color.CYAN) + colored(desc, Color.DIM))
+        print()
 
-📋 会话管理:
-  /sessions      列出所有保存的会话
-  /save <file>   手动保存对话
-  /load <file>   加载对话
-
-⚙️ 设置:
-  /model <name>   切换模型 (flash/pro/pro3)
-  /backend <name> 切换后端 (google/openai/local)
-  /stream         切换流式输出
-  /mode [box]     切换输入模式
-
-🔧 Function Calling:
-  /tools add <name>  添加工具 (weather/search/calculator/bash)
-  /tools list        列出可用工具
-  /call <prompt>     强制使用 Function Calling
-
-快捷键:
-  Ctrl+C    保存上下文并继续
-  Ctrl+D    退出（自动保存）
-
-存储位置: ~/.gchat/sessions/
-"""
-    print(colored(help_text, Color.YELLOW))
+    print(colored("  Shortcuts", Color.BOLD))
+    print(colored("    Ctrl+C", Color.CYAN) + colored("            save & continue", Color.DIM))
+    print(colored("    Ctrl+D", Color.CYAN) + colored("            exit (auto-save)", Color.DIM))
+    print()
+    print(colored(f"  Storage: ~/.gchat/sessions/", Color.DIM))
+    print()
 
 def official_api_request(messages, model, tools=None, api_key=None):
     """使用Google官方API发送请求（支持Function Calling）"""
@@ -940,11 +936,13 @@ def interactive_mode(model, backend_name, continue_session=False):
             print()
 
     print_header()
-    # 状态层 (Status Context)
-    print(colored("○", Color.DIM) + f" Model: {colored(model, Color.CYAN)}")
-    print(colored("○", Color.DIM) + f" Backend: {colored(backend_config['name'], Color.DIM)}")
-    session_status = 'Continuing' if (continue_session and loaded_file) else 'New'
-    print(colored("○", Color.DIM) + f" Session: {colored(session_status, Color.GREEN)}")
+    # 状态层 - 紧凑单行显示
+    session_status = 'continuing' if (continue_session and loaded_file) else 'new'
+    status_line = (
+        colored("  model:", Color.DIM) + colored(f" {model}", Color.CYAN) +
+        colored("  session:", Color.DIM) + colored(f" {session_status}", Color.GREEN)
+    )
+    print(status_line)
     print()
 
     input_mode = 'normal'  # normal | box
@@ -958,9 +956,10 @@ def interactive_mode(model, backend_name, continue_session=False):
             history = None
 
     def prompt_text() -> str:
+        # Claude Code 风格输入框
         if input_mode == 'box':
-            return colored("nx ϟ[box] ", Color.CYAN + Color.BOLD)
-        return colored("nx ϟ ", Color.CYAN + Color.BOLD)
+            return colored("› ", Color.MAGENTA + Color.BOLD) + colored("[box] ", Color.DIM)
+        return colored("› ", Color.MAGENTA + Color.BOLD)
 
     def read_user_message(force_box: bool = False, default_text: str = "") -> str | None:
         """读取用户输入。
@@ -1109,7 +1108,7 @@ def interactive_mode(model, backend_name, continue_session=False):
 
                 if cmd in ['quit', 'q', 'exit']:
                     auto_save_history(messages, model)
-                    print(colored("再见！", Color.CYAN))
+                    print(colored("  bye.", Color.DIM))
                     break
                 elif cmd in ['help', 'h']:
                     print_help()
@@ -1470,7 +1469,7 @@ def interactive_mode(model, backend_name, continue_session=False):
         except EOFError:
             print()
             auto_save_history(messages, model)
-            print(colored("再见！", Color.CYAN))
+            print(colored("  bye.", Color.DIM))
             break
 
 def single_prompt(prompt, model, backend_name, output_json=False, use_stream=False):
