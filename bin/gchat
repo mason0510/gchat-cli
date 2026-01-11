@@ -362,16 +362,9 @@ def normalize_messages_for_api(messages: list[dict]) -> list[dict]:
     return out
 
 def print_header():
-    """打印欢迎信息 - Claude Code 风格"""
-    # 品牌层
-    print(colored("╭─", Color.DIM) + colored(" gchat", Color.BOLD + Color.MAGENTA) + colored(" v5.0", Color.DIM))
-    print(colored("│", Color.DIM))
-    # 引导层
-    print(colored("│", Color.DIM) + colored("  /help", Color.CYAN) + colored(" commands  ", Color.DIM) + colored("/quit", Color.CYAN) + colored(" exit", Color.DIM))
-    print(colored("╰─", Color.DIM))
-
-    # 分隔线
-    print(colored("—", Color.DIM))
+    """打印欢迎信息"""
+    print(colored("  gchat", Color.BOLD + Color.MAGENTA) + colored(" v5.0", Color.DIM))
+    print()
 
 def print_help():
     """打印帮助信息 - Claude Code 风格"""
@@ -1216,7 +1209,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                             "content": f"请分析以下文件内容:\n\n文件: {file_path}\n\n```\n{content}\n```"
                         }
                     messages.append(user_message)
-                    print(colored("AI>", Color.CYAN))
+                    print()  # AI response follows
                     if use_stream:
                         response = chat_request_with_fallback_stream(messages, model, backend_config)
                     else:
@@ -1329,7 +1322,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                         # 记录到历史
                         messages.append({"role": "assistant", "content": f"[调用函数 {fc_name}]\n参数: {json.dumps(fc_args, ensure_ascii=False)}\n结果: {json.dumps(fc_result, ensure_ascii=False)}"})
                     else:
-                        print(colored("AI>", Color.CYAN))
+                        print()  # AI response follows
                         print(result["content"])
                         messages.append({"role": "assistant", "content": result["content"]})
                     print()
@@ -1406,7 +1399,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                     }
                     messages.append(user_message)
 
-                    print(colored("AI>", Color.CYAN))
+                    print()  # AI response follows
                     response = chat_request_with_fallback(messages, model, backend_config)
                     print(response)
                     print()
@@ -1435,7 +1428,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                 messages.append({"role": "user", "content": confirmed_text})
 
             # 发送请求 - 混合路由逻辑
-            print(colored("AI>", Color.CYAN))
+            print()  # AI response follows
 
             if enabled_tools and backend_config.get("supports_tools"):
                 # 有工具且后端支持时，使用工具调用
