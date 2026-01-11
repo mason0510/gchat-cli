@@ -27,7 +27,6 @@ import signal
 import glob as glob_module
 import threading
 import time
-import random
 from pathlib import Path
 
 from wcwidth import wcswidth, wcwidth
@@ -414,22 +413,38 @@ class StatusSpinner:
 
 
 TIPS = [
-    "git commit -m 'fix bug' 后发现还有 bug，是宿命。",
-    "代码能跑就不要动。除非你想加班。",
-    "没有什么 bug 是重启解决不了的，如果有，就重装。",
-    "今天的你写的代码，明天的你看不懂。",
-    "与其优化代码，不如优化需求。",
-    "deadline 是第一生产力。",
-    "好的代码自己会说话，坏的代码需要注释。",
-    "先让它工作，再让它正确，最后让它快。",
-    "一个 TODO 放三年，就成了 TODON'T。",
-    "If it works, don't touch it.",
+    "git commit -m 'fix' 后发现还有 bug，这是宿命",
+    "代码能跑就不要动，除非你想加班",
+    "没有什么是重启解决不了的",
+    "今天写的代码，明天就看不懂了",
+    "与其优化代码，不如优化需求",
+    "deadline 是第一生产力",
+    "好代码自己会说话，坏代码需要注释",
+    "先让它跑，再让它对，最后让它快",
+    "一个 TODO 放三年，就成了 TODON'T",
+    "If it works, don't touch it",
+    "99 个 bug 修完，还剩 127 个",
+    "程序员最讨厌的两件事：写注释和没注释",
+    "这段代码为什么能跑？别问，问就是玄学",
+    "rm -rf / 一时爽，一直 rm 一直爽？",
+    "你的代码不是屎山，是屎喜马拉雅",
+    "Talk is cheap, show me the code",
+    "It works on my machine",
+    "永远不要相信用户输入",
+    "复制粘贴，程序员的核心竞争力",
+    "写代码一时爽，重构火葬场",
 ]
+
+def get_tip():
+    """根据时间戳选择段子，每次启动不同"""
+    idx = int(time.time()) % len(TIPS)
+    return TIPS[idx]
+
 
 def print_header():
     """打印欢迎信息"""
     print(colored("  gchat", Color.BOLD + Color.MAGENTA) + colored(" v5.0", Color.DIM) + colored("  nexusai.aihang365.com", Color.DIM))
-    print(colored(f"  {random.choice(TIPS)}", Color.DIM))
+    print(colored(f"  {get_tip()}", Color.DIM))
     print()
 
 def print_help():
