@@ -1566,7 +1566,8 @@ def interactive_mode(model, backend_name, continue_session=False):
                 messages.append({"role": "user", "content": confirmed_text})
 
             # 发送请求 - 混合路由逻辑
-            print()  # AI response follows
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
             if enabled_tools and backend_config.get("supports_tools"):
                 # 有工具且后端支持时，使用工具调用
