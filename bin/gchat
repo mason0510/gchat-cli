@@ -464,6 +464,130 @@ def get_tip():
     return TIPS[idx]
 
 
+# ============== 偏好持久化 ==============
+def get_preferences_path():
+    """获取偏好文件路径"""
+    return os.path.expanduser("~/.gchat/GCHAT.md")
+
+def load_preferences():
+    """加载 GCHAT.md 作为系统提示
+
+    类似 Claude Code 的 CLAUDE.md，用于存储用户偏好和项目上下文
+    """
+    path = get_preferences_path()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+            if content:
+                return content
+        except Exception:
+            pass
+    return None
+
+
+# ============== 上下文压缩 ==============
+# 压缩配置
+CONTEXT_CONFIG = {
+    "max_messages": 20,       # 最大消息数
+    "compress_threshold": 16, # 触发压缩的阈值
+    "preserve_recent": 6,     # 保留最近N条消息不压缩
+    "summary_max_len": 500,   # 摘要最大长度
+}
+
+def estimate_tokens(text):
+    """粗略估算 token 数（中文约1.5字/token，英文约4字符/token）"""
+    if not text:
+        return 0
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    other_chars = len(text) - chinese_chars
+    return int(chinese_chars * 1.5 + other_chars / 4)
+
+def compress_context(messages, backend_config, model):
+    """智能上下文压缩 - 借鉴 Claude Code 的 wU2 压缩策略
+
+    当消息数超过阈值时：
+    1. 保留 system 消息
+    2. 保留最近 N 条消息
+    3. 将旧消息压缩为摘要
+    """
+    if len(messages) < CONTEXT_CONFIG["compress_threshold"]:
+        return messages, False
+
+    # 分离 system 消息和对话消息
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    chat_msgs = [m for m in messages if m.get("role") != "system"]
+
+    if len(chat_msgs) < CONTEXT_CONFIG["compress_threshold"]:
+        return messages, False
+
+    # 保留最近的消息
+    preserve_count = CONTEXT_CONFIG["preserve_recent"]
+    old_msgs = chat_msgs[:-preserve_count]
+    recent_msgs = chat_msgs[-preserve_count:]
+
+    # 生成摘要
+    summary = generate_context_summary(old_msgs, backend_config, model)
+
+    if summary:
+        # 构建压缩后的消息列表
+        compressed = system_msgs.copy()
+        compressed.append({
+            "role": "system",
+            "content": f"[对话历史摘要]\n{summary}\n[以上为早期对话摘要，以下为最近对话]"
+        })
+        compressed.extend(recent_msgs)
+        return compressed, True
+
+    # 压缩失败，返回原消息但截断
+    return system_msgs + chat_msgs[-CONTEXT_CONFIG["max_messages"]:], False
+
+def generate_context_summary(messages, backend_config, model):
+    """生成对话摘要"""
+    if not messages:
+        return None
+
+    # 构建要摘要的内容
+    content_parts = []
+    for msg in messages:
+        role = "用户" if msg.get("role") == "user" else "AI"
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # 多模态消息，只取文本部分
+            content = " ".join([p.get("text", "") for p in content if p.get("type") == "text"])
+        # 截断过长的单条消息
+        if len(content) > 200:
+            content = content[:200] + "..."
+        content_parts.append(f"{role}: {content}")
+
+    dialog_text = "\n".join(content_parts)
+
+    # 如果对话太短，不需要摘要
+    if len(dialog_text) < 300:
+        return None
+
+    # 使用 API 生成摘要
+    summary_prompt = f"""请用1-3句话简洁总结以下对话的主要内容和关键信息，不要遗漏重要细节：
+
+{dialog_text[:2000]}
+
+摘要："""
+
+    try:
+        summary_messages = [{"role": "user", "content": summary_prompt}]
+        # 使用非流式请求获取摘要
+        result = chat_request(summary_messages, model, backend_config, retry=1, debug=False)
+        if result and not result.startswith("["):
+            # 限制摘要长度
+            return result[:CONTEXT_CONFIG["summary_max_len"]]
+    except Exception:
+        pass
+
+    # API 调用失败，返回简单摘要
+    turns = len(messages) // 2
+    return f"[早期对话 {turns} 轮，内容已压缩]"
+
+
 LOGO_LINES = [
     " ██████╗   ██████╗ ██╗  ██╗  █████╗ ████████╗",
     "██╔════╝  ██╔════╝ ██║  ██║ ██╔══██╗╚══██╔══╝",
@@ -721,6 +845,8 @@ def print_help():
             ("/backend <name>", "switch backend"),
             ("/stream", "toggle streaming"),
             ("/mode [box]", "toggle input mode"),
+            ("/prefs [edit]", "manage preferences (GCHAT.md)"),
+            ("/status", "show current status"),
         ]),
     ]
 
@@ -1286,11 +1412,21 @@ def interactive_mode(model, backend_name, continue_session=False):
     enabled_tools = []
     use_stream = True   # 默认启用流式输出
 
+    # 加载用户偏好 (GCHAT.md) 作为系统提示
+    preferences = load_preferences()
+    if preferences:
+        messages.append({"role": "system", "content": preferences})
+        print(colored("○", Color.DIM) + " Loaded: " + colored("~/.gchat/GCHAT.md", Color.CYAN))
+
     # 如果是继续会话模式，尝试加载最近的历史
     if continue_session:
         loaded_messages, loaded_model, loaded_file = load_latest_history()
         if loaded_messages:
-            messages = loaded_messages
+            # 保留 system 消息，追加历史对话
+            if preferences:
+                # 过滤掉历史中的 system 消息，避免重复
+                loaded_messages = [m for m in loaded_messages if m.get("role") != "system"]
+            messages.extend(loaded_messages)
             if loaded_model:
                 model = loaded_model
             print(colored("○", Color.DIM) + f" Loaded: {colored(loaded_file, Color.DIM)}")
@@ -1525,7 +1661,49 @@ def interactive_mode(model, backend_name, continue_session=False):
                     turns = len(messages) // 2
                     stream_status = "on" if use_stream else "off"
                     tools_status = ', '.join([t['name'] for t in enabled_tools]) if enabled_tools else "-"
-                    print(colored(f"  {model}  ·  {turns} turns  ·  stream {stream_status}  ·  tools: {tools_status}", Color.DIM))
+                    prefs_status = "on" if preferences else "off"
+                    print(colored(f"  {model}  ·  {turns} turns  ·  stream {stream_status}  ·  prefs {prefs_status}", Color.DIM))
+                elif cmd in {'prefs', 'preferences'}:
+                    # 管理偏好文件
+                    prefs_path = get_preferences_path()
+                    if cmd_arg == 'edit':
+                        # 用默认编辑器打开
+                        editor = os.environ.get('EDITOR', 'vim')
+                        os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
+                        if not os.path.exists(prefs_path):
+                            # 创建模板
+                            with open(prefs_path, 'w', encoding='utf-8') as f:
+                                f.write("# GCHAT 偏好设置\n\n")
+                                f.write("# 这个文件的内容会作为系统提示发送给 AI\n")
+                                f.write("# 你可以在这里设置：\n")
+                                f.write("# - 偏好的回复风格\n")
+                                f.write("# - 常用的上下文信息\n")
+                                f.write("# - 项目相关的说明\n\n")
+                        os.system(f'{editor} "{prefs_path}"')
+                        # 重新加载
+                        preferences = load_preferences()
+                        if preferences:
+                            # 更新 messages 中的 system 消息
+                            messages = [m for m in messages if m.get("role") != "system" or "[对话历史摘要]" in m.get("content", "")]
+                            messages.insert(0, {"role": "system", "content": preferences})
+                            print(colored("→ preferences reloaded", Color.GREEN))
+                    elif cmd_arg == 'show':
+                        if os.path.exists(prefs_path):
+                            with open(prefs_path, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                            print(colored("─" * 40, Color.DIM))
+                            print(content)
+                            print(colored("─" * 40, Color.DIM))
+                        else:
+                            print(colored("  no preferences file", Color.DIM))
+                    elif cmd_arg == 'path':
+                        print(colored(f"  {prefs_path}", Color.DIM))
+                    else:
+                        prefs_exists = os.path.exists(prefs_path)
+                        print(colored(f"→ prefs: {'on' if prefs_exists else 'off'}", Color.GREEN if prefs_exists else Color.DIM))
+                        print(colored(f"  path: {prefs_path}", Color.DIM))
+                        print(colored("  /prefs edit  - 编辑偏好文件", Color.DIM))
+                        print(colored("  /prefs show  - 显示当前内容", Color.DIM))
                 elif cmd == 'sessions':
                     # 列出所有会话
                     sessions = list_sessions()
@@ -1785,6 +1963,11 @@ def interactive_mode(model, backend_name, continue_session=False):
             # 发送请求 - 混合路由逻辑
             sys.stdout.write("\n")
             sys.stdout.flush()
+
+            # 上下文压缩 - 当消息过多时自动摘要
+            messages, compressed = compress_context(messages, backend_config, model)
+            if compressed:
+                print(colored("○ context compressed", Color.DIM))
 
             if enabled_tools and backend_config.get("supports_tools"):
                 # 有工具且后端支持时，使用工具调用
