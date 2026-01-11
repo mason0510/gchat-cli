@@ -23,6 +23,8 @@ import mimetypes
 import re
 import shlex
 import shutil
+import signal
+import glob as glob_module
 from pathlib import Path
 
 from wcwidth import wcswidth, wcwidth
@@ -379,41 +381,39 @@ def print_header():
 def print_help():
     """打印帮助信息"""
     help_text = """
-可用命令:
+基础命令:
   /help, /h      显示帮助
-  /quit, /q      退出程序（自动保存会话历史）
+  /quit, /q      退出程序（自动保存）
   /clear, /c     清空对话历史
   /history       显示对话历史
-  /model <name>  切换模型 (flash/pro/pro3)
-  /backend <name> 切换后端 (local/nexus/official)
   /status        显示当前状态
-  /save <file>   手动保存对话到指定文件
-  /load <file>   从文件加载对话
-  /paste         进入多行输入框（Ctrl+S 发送，Ctrl+G 取消；无 prompt_toolkit 时用 . 结束）
-  /img <path..> [text]  发送图片（也支持直接拖拽图片路径到输入）
-  /mode [normal|box]  切换输入模式（默认 normal）
 
-🔧 Function Calling (混合模式):
-  /tools                列出当前启用的工具
-  /tools add <name>     添加工具 (weather/search/calculator/bash)
-  /tools remove <name>  移除工具
-  /tools clear          清空所有工具
-  /tools list           列出所有可用工具
-  /call <prompt>        强制使用官方API进行Function Calling
+📁 文件操作:
+  /read <file>   读取文件让 AI 分析
+  /write <file>  保存最后一条 AI 回复到文件
+  /img <path>    分析图片
 
-  💡 启用工具后，会自动切换到官方API后端
+📋 会话管理:
+  /sessions      列出所有保存的会话
+  /save <file>   手动保存对话
+  /load <file>   加载对话
+
+⚙️ 设置:
+  /model <name>   切换模型 (flash/pro/pro3)
+  /backend <name> 切换后端 (google/openai/local)
+  /stream         切换流式输出
+  /mode [box]     切换输入模式
+
+🔧 Function Calling:
+  /tools add <name>  添加工具 (weather/search/calculator/bash)
+  /tools list        列出可用工具
+  /call <prompt>     强制使用 Function Calling
 
 快捷键:
-  Ctrl+C         中断当前操作
-  Ctrl+D         退出程序（自动保存会话历史）
-  上/下箭头      浏览历史输入
+  Ctrl+C    保存上下文并继续
+  Ctrl+D    退出（自动保存）
 
-输入模式:
-  normal: Enter 发送；输入末尾为 \\ 时续行
-  box:    多行输入框；Enter 换行；Ctrl+S 发送；Ctrl+G 取消
-
-自动保存:
-  退出时会自动保存会话到: ~/.gchat/sessions/gchat_history_YYYYMMDD_HHMMSS.json
+存储位置: ~/.gchat/sessions/
 """
     print(colored(help_text, Color.YELLOW))
 
@@ -677,6 +677,102 @@ def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=F
 
     return response
 
+
+def chat_request_stream(messages, model, backend_config, debug=False):
+    """流式发送聊天请求，兼容 SSE 流和完整 JSON 响应"""
+    url = backend_config["url"]
+    payload = {
+        "model": model,
+        "messages": normalize_messages_for_api(messages),
+        "stream": True,
+    }
+
+    # 构建curl命令
+    curl_cmd = [
+        'curl', '-X', 'POST', url,
+        '-H', 'Content-Type: application/json',
+        '-H', 'Accept: text/event-stream',
+        '--max-time', '300',
+        '--connect-timeout', '30',
+        '-N',  # 禁用缓冲
+    ]
+
+    if not debug:
+        curl_cmd.insert(1, '-s')
+
+    if "key" in backend_config:
+        curl_cmd.extend(['-H', f'Authorization: Bearer {backend_config["key"]}'])
+
+    curl_cmd.extend(['-d', json.dumps(payload)])
+
+    try:
+        process = subprocess.Popen(
+            curl_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        full_response = ""
+        raw_output = ""
+
+        for line in process.stdout:
+            raw_output += line
+            line = line.strip()
+            if not line:
+                continue
+
+            # 尝试 SSE 格式
+            if line.startswith("data: "):
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    if "choices" in chunk and chunk["choices"]:
+                        delta = chunk["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            print(content, end="", flush=True)
+                            full_response += content
+                except json.JSONDecodeError:
+                    continue
+
+        process.wait()
+
+        # 如果没有 SSE 流数据，尝试解析完整 JSON
+        if not full_response and raw_output.strip():
+            try:
+                result = json.loads(raw_output.strip())
+                if "choices" in result and result["choices"]:
+                    content = result["choices"][0].get("message", {}).get("content", "")
+                    if content:
+                        print(content)
+                        return content
+            except json.JSONDecodeError:
+                pass
+
+        if full_response:
+            print()  # 换行
+        return full_response if full_response else "[无响应]"
+
+    except Exception as e:
+        return f"[流式请求错误]: {str(e)}"
+
+
+def chat_request_with_fallback_stream(messages, model, backend_config, debug=False):
+    """流式请求，失败时降级"""
+    response = chat_request_stream(messages, model, backend_config, debug=debug)
+
+    if response.startswith("[") and model in FALLBACK_MODELS:
+        fallback_model = FALLBACK_MODELS[model]
+        print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
+        response = chat_request_stream(messages, fallback_model, backend_config, debug=debug)
+
+    return response
+
+
 def auto_save_history(messages, model):
     """自动保存会话历史到 ~/.gchat/sessions/"""
     if not messages or len(messages) == 0:
@@ -717,6 +813,81 @@ def load_latest_history():
         print(colored(f"⚠️  加载会话失败: {e}", Color.RED))
         return None, None, None
 
+
+def list_sessions():
+    """列出所有会话"""
+    sessions_dir = get_sessions_dir()
+    history_files = glob_module.glob(os.path.join(sessions_dir, "gchat_history_*.json"))
+
+    if not history_files:
+        print(colored("没有保存的会话", Color.YELLOW))
+        return []
+
+    sessions = []
+    for f in sorted(history_files, reverse=True):
+        try:
+            with open(f, 'r', encoding='utf-8') as fp:
+                data = json.load(fp)
+                msg_count = len(data.get("messages", []))
+                model = data.get("model", "unknown")
+                timestamp = data.get("timestamp", "")
+                # 获取第一条用户消息作为预览
+                preview = ""
+                for msg in data.get("messages", []):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            preview = content[:50] + "..." if len(content) > 50 else content
+                        break
+                sessions.append({
+                    "file": f,
+                    "timestamp": timestamp,
+                    "model": model,
+                    "msg_count": msg_count,
+                    "preview": preview
+                })
+        except Exception:
+            continue
+
+    return sessions
+
+
+def read_file_content(file_path):
+    """读取文件内容用于AI分析"""
+    path = Path(file_path).expanduser()
+    if not path.exists():
+        return None, f"文件不存在: {file_path}"
+
+    # 检查是否是图片
+    if is_image_file(path):
+        return {"type": "image", "path": str(path)}, None
+
+    # 读取文本文件
+    try:
+        # 限制文件大小 (最大 500KB)
+        if path.stat().st_size > 500 * 1024:
+            return None, f"文件过大 (>{500}KB): {file_path}"
+
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        return {"type": "text", "content": content, "path": str(path)}, None
+    except Exception as e:
+        return None, f"读取失败: {e}"
+
+
+def write_to_file(file_path, content):
+    """将内容写入文件"""
+    path = Path(file_path).expanduser()
+    try:
+        # 确保目录存在
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True, str(path)
+    except Exception as e:
+        return False, str(e)
+
+
 def execute_function(name, args):
     """执行函数调用（模拟实现）"""
     if name == "get_weather":
@@ -755,6 +926,7 @@ def interactive_mode(model, backend_name, continue_session=False):
     messages = []
     loaded_file = None
     enabled_tools = []  # 当前启用的工具列表
+    use_stream = True   # 默认启用流式输出
 
     # 如果是继续会话模式，尝试加载最近的历史
     if continue_session:
@@ -977,6 +1149,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                     print(f"模型: {model}")
                     print(f"后端: {backend_config['name']}")
                     print(f"对话轮数: {len(messages) // 2}")
+                    print(f"流式输出: {'开启' if use_stream else '关闭'}")
                     if enabled_tools:
                         print(f"启用工具: {', '.join([t['name'] for t in enabled_tools])}")
                         if backend_config.get("supports_tools"):
@@ -985,6 +1158,83 @@ def interactive_mode(model, backend_name, continue_session=False):
                             print(colored("  ⚠️  当前后端不支持工具调用，请切换到 google 后端", Color.YELLOW))
                     else:
                         print(f"启用工具: 无")
+                elif cmd == 'sessions':
+                    # 列出所有会话
+                    sessions = list_sessions()
+                    if sessions:
+                        print(colored("保存的会话:", Color.GREEN))
+                        for i, s in enumerate(sessions[:10]):  # 最多显示10个
+                            ts = s["timestamp"]
+                            if ts:
+                                ts = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}"
+                            print(f"  [{i+1}] {ts} | {s['model']} | {s['msg_count']}条 | {s['preview']}")
+                        if len(sessions) > 10:
+                            print(colored(f"  ... 还有 {len(sessions) - 10} 个会话", Color.DIM))
+                        print(colored("\n使用 /load <编号> 加载会话", Color.YELLOW))
+                elif cmd == 'read':
+                    # 读取文件
+                    if not cmd_arg:
+                        print(colored("用法: /read <文件路径>", Color.YELLOW))
+                        continue
+                    file_result, error = read_file_content(cmd_arg)
+                    if error:
+                        print(colored(error, Color.RED))
+                        continue
+                    if file_result["type"] == "image":
+                        # 图片文件，转到图片处理
+                        print(colored(f"📷 检测到图片: {file_result['path']}", Color.CYAN))
+                        user_message = {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "请描述这张图片。"},
+                                {"type": "image_file", "path": file_result["path"]}
+                            ],
+                        }
+                    else:
+                        # 文本文件
+                        content = file_result["content"]
+                        file_path = file_result["path"]
+                        line_count = content.count('\n') + 1
+                        print(colored(f"📄 已读取: {file_path} ({line_count} 行)", Color.CYAN))
+                        user_message = {
+                            "role": "user",
+                            "content": f"请分析以下文件内容:\n\n文件: {file_path}\n\n```\n{content}\n```"
+                        }
+                    messages.append(user_message)
+                    print(colored("AI>", Color.CYAN))
+                    if use_stream:
+                        response = chat_request_with_fallback_stream(messages, model, backend_config)
+                    else:
+                        response = chat_request_with_fallback(messages, model, backend_config)
+                        print(response)
+                    print()
+                    messages.append({"role": "assistant", "content": response})
+                elif cmd == 'write':
+                    # 写入文件
+                    if not cmd_arg:
+                        print(colored("用法: /write <文件路径>", Color.YELLOW))
+                        continue
+                    if not messages:
+                        print(colored("没有可保存的内容", Color.YELLOW))
+                        continue
+                    # 获取最后一条AI回复
+                    last_response = None
+                    for msg in reversed(messages):
+                        if msg.get("role") == "assistant":
+                            last_response = msg.get("content", "")
+                            break
+                    if not last_response:
+                        print(colored("没有AI回复可保存", Color.YELLOW))
+                        continue
+                    success, result = write_to_file(cmd_arg, last_response)
+                    if success:
+                        print(colored(f"✅ 已保存到: {result}", Color.GREEN))
+                    else:
+                        print(colored(f"❌ 保存失败: {result}", Color.RED))
+                elif cmd == 'stream':
+                    # 切换流式输出
+                    use_stream = not use_stream
+                    print(colored(f"流式输出: {'开启' if use_stream else '关闭'}", Color.GREEN))
                 elif cmd == 'tools':
                     if not cmd_arg:
                         # 列出当前启用的工具
@@ -1202,8 +1452,11 @@ def interactive_mode(model, backend_name, continue_session=False):
                     print(response)
             else:
                 # 无工具或后端不支持时使用普通请求
-                response = chat_request_with_fallback(messages, model, backend_config)
-                print(response)
+                if use_stream:
+                    response = chat_request_with_fallback_stream(messages, model, backend_config)
+                else:
+                    response = chat_request_with_fallback(messages, model, backend_config)
+                    print(response)
 
             print()
 
@@ -1211,20 +1464,37 @@ def interactive_mode(model, backend_name, continue_session=False):
             messages.append({"role": "assistant", "content": response})
 
         except KeyboardInterrupt:
-            print("\n" + colored("(使用 /quit 退出)", Color.YELLOW))
+            # 实时中断：保存上下文
+            print("\n" + colored("💾 已保存上下文，按 Enter 继续或 /q 退出", Color.YELLOW))
+            auto_save_history(messages, model)
         except EOFError:
             print()
             auto_save_history(messages, model)
             print(colored("再见！", Color.CYAN))
             break
 
-def single_prompt(prompt, model, backend_name):
+def single_prompt(prompt, model, backend_name, output_json=False, use_stream=False):
     """单次提问模式"""
     backend_config = BACKENDS[backend_name]
     model = resolve_model(model)
     messages = [{"role": "user", "content": prompt}]
-    response = chat_request_with_fallback(messages, model, backend_config)
-    print(response)
+
+    if use_stream and not output_json:
+        response = chat_request_with_fallback_stream(messages, model, backend_config)
+    else:
+        response = chat_request_with_fallback(messages, model, backend_config)
+
+    if output_json:
+        result = {
+            "model": model,
+            "backend": backend_name,
+            "prompt": prompt,
+            "response": response,
+            "success": not response.startswith("[")
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif not use_stream:
+        print(response)
 
 def list_models():
     """列出可用模型"""
@@ -1246,15 +1516,23 @@ def list_models():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Gemini Chat CLI - 多轮会话命令行工具",
+        description="Gemini Chat CLI - 多轮会话命令行工具 (Claude Code 的轻量多模型网关)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  gchat                    开启新对话
-  gchat -c                 继续上次对话（自动加载最近会话）
-  gchat -m pro             使用pro模型
+  gchat                    开启新对话 (流式输出)
+  gchat -c                 继续上次对话
+  gchat -m pro             使用 pro 模型
   gchat -p "解释量子计算"   单次提问
-  gchat --backend nexus    使用NexusAI后端
+  gchat -p "问题" --json   JSON 格式输出 (脚本集成)
+  gchat --backend openai   使用 OpenAI 后端
+
+交互命令:
+  /read <file>   读取文件让 AI 分析
+  /write <file>  保存 AI 回复到文件
+  /sessions      列出所有会话
+  /stream        切换流式输出
+  /help          查看更多命令
         """
     )
 
@@ -1267,6 +1545,10 @@ def main():
     parser.add_argument('-b', '--backend', default='google',
                         choices=BACKENDS.keys(),
                         help='后端选择 (默认: google)')
+    parser.add_argument('--json', dest='output_json', action='store_true',
+                        help='输出 JSON 格式（用于脚本集成）')
+    parser.add_argument('--no-stream', dest='no_stream', action='store_true',
+                        help='禁用流式输出')
     parser.add_argument('--list-models', action='store_true',
                         help='列出可用模型和后端')
 
@@ -1277,7 +1559,9 @@ def main():
         return
 
     if args.prompt:
-        single_prompt(args.prompt, args.model, args.backend)
+        single_prompt(args.prompt, args.model, args.backend,
+                     output_json=args.output_json,
+                     use_stream=not args.no_stream)
     else:
         interactive_mode(args.model, args.backend, continue_session=args.continue_session)
 
