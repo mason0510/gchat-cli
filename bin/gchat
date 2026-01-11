@@ -161,6 +161,29 @@ BUILTIN_TOOLS = {
             "required": ["command"]
         }
     },
+    "write": {
+        "name": "write_file",
+        "description": "将内容写入文件。当用户要求保存内容到文件时使用此工具。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径，如 'poem.md'、'output.txt'"},
+                "content": {"type": "string", "description": "要写入的内容"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    "read": {
+        "name": "read_file",
+        "description": "读取文件内容。当用户要求分析或查看文件时使用此工具。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径"}
+            },
+            "required": ["path"]
+        }
+    },
 }
 
 # 颜色输出
@@ -1002,6 +1025,23 @@ def execute_function(name, args):
             return {"command": command, "stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
         except Exception as e:
             return {"error": str(e)}
+    elif name == "write_file":
+        path = args.get("path", "")
+        content = args.get("content", "")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return {"success": True, "path": path, "message": f"已写入 {len(content)} 字符到 {path}"}
+        except Exception as e:
+            return {"error": str(e)}
+    elif name == "read_file":
+        path = args.get("path", "")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return {"success": True, "path": path, "content": content[:5000]}  # 限制长度
+        except Exception as e:
+            return {"error": str(e)}
     else:
         return {"error": f"未知函数: {name}"}
 
@@ -1012,7 +1052,8 @@ def interactive_mode(model, backend_name, continue_session=False):
     model = resolve_model(model)
     messages = []
     loaded_file = None
-    enabled_tools = []  # 当前启用的工具列表
+    # 默认启用文件读写工具
+    enabled_tools = [BUILTIN_TOOLS["read"], BUILTIN_TOOLS["write"]]
     use_stream = True   # 默认启用流式输出
 
     # 如果是继续会话模式，尝试加载最近的历史
