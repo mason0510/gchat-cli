@@ -52,12 +52,13 @@ def sanitize_terminal_paste(text: str) -> str:
 
 try:
     from prompt_toolkit import prompt as pt_prompt
-    from prompt_toolkit.formatted_text import ANSI as PTANSI
+    from prompt_toolkit.formatted_text import ANSI as PTANSI, HTML
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
 except Exception:
     pt_prompt = None
     PTANSI = None
+    HTML = None
     FileHistory = None
     KeyBindings = None
 
@@ -1010,6 +1011,19 @@ def interactive_mode(model, backend_name, continue_session=False):
                 buf.validate_and_handle()
 
             prompt_obj = PTANSI(prompt_text()) if PTANSI else prompt_text()
+
+            # 占位提示文字
+            placeholder_text = HTML('<style fg="ansibrightblack">Type message or /help for commands</style>') if HTML else None
+
+            # 底部状态栏
+            def get_toolbar():
+                msg_count = len(messages)
+                turns = msg_count // 2
+                stream_status = "stream on" if use_stream else "stream off"
+                return HTML(f'<style fg="ansibrightblack">  {model}  ·  {turns} turns  ·  {stream_status}</style>')
+
+            toolbar_func = get_toolbar if HTML else None
+
             try:
                 text = pt_prompt(
                     prompt_obj,
@@ -1018,6 +1032,8 @@ def interactive_mode(model, backend_name, continue_session=False):
                     key_bindings=kb,
                     history=history,
                     wrap_lines=True,
+                    placeholder=placeholder_text,
+                    bottom_toolbar=toolbar_func,
                 )
             except KeyboardInterrupt:
                 return None
