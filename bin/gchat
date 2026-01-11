@@ -771,8 +771,8 @@ def interactive_mode(model, backend_name, continue_session=False):
 
     def prompt_text() -> str:
         if input_mode == 'box':
-            return colored("◆ You[box] › ", Color.MAGENTA + Color.BOLD)
-        return colored("◆ You › ", Color.MAGENTA + Color.BOLD)
+            return colored("nx ϟ[box] ", Color.CYAN + Color.BOLD)
+        return colored("nx ϟ ", Color.CYAN + Color.BOLD)
 
     def read_user_message(force_box: bool = False, default_text: str = "") -> str | None:
         """读取用户输入。
