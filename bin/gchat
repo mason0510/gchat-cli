@@ -464,24 +464,237 @@ def get_tip():
     return TIPS[idx]
 
 
-LOGO = r"""
-  ██████╗    ██████╗  ██╗   ██╗   █████╗   ████████╗
- ██╔════╝   ██╔════╝  ██║   ██║  ██╔══██╗  ╚══██╔══╝
- ██║  ███╗  ██║       ████████║  ███████║     ██║
- ██║   ██║  ██║       ██╔══██║   ██╔══██║     ██║
- ╚██████╔╝  ╚██████╗  ██║  ██║   ██║  ██║     ██║
-  ╚═════╝    ╚═════╝  ╚═╝  ╚═╝   ╚═╝  ╚═╝     ╚═╝
-"""
+LOGO_LINES = [
+    " ██████╗   ██████╗ ██╗  ██╗  █████╗ ████████╗",
+    "██╔════╝  ██╔════╝ ██║  ██║ ██╔══██╗╚══██╔══╝",
+    "██║  ███╗ ██║      ███████║ ███████║   ██║   ",
+    "██║   ██║ ██║      ██╔══██║ ██╔══██║   ██║   ",
+    "╚██████╔╝ ╚██████╗ ██║  ██║ ██║  ██║   ██║   ",
+    " ╚═════╝   ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝   ╚═╝   ",
+]
+
+def get_recent_sessions(limit=3):
+    """获取最近的会话"""
+    sessions_dir = os.path.expanduser("~/.gchat/sessions")
+    if not os.path.exists(sessions_dir):
+        return []
+
+    files = []
+    for f in os.listdir(sessions_dir):
+        if f.endswith('.json'):
+            path = os.path.join(sessions_dir, f)
+            files.append((os.path.getmtime(path), f, path))
+
+    files.sort(reverse=True)
+
+    recent = []
+    for mtime, fname, path in files[:limit]:
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+
+            # 支持两种格式：直接数组 或 {messages: [...]}
+            messages = data.get('messages', data) if isinstance(data, dict) else data
+
+            if messages and len(messages) > 0:
+                first_msg = ""
+                for msg in messages:
+                    if msg.get('role') == 'user':
+                        content = msg.get('content', '')
+                        if isinstance(content, list):  # multimodal content
+                            content = str(content[0].get('text', '')) if content else ''
+                        first_msg = content[:22]
+                        if len(content) > 22:
+                            first_msg += "..."
+                        break
+                if first_msg:
+                    time_str = time.strftime("%m/%d %H:%M", time.localtime(mtime))
+                    recent.append((time_str, first_msg))
+        except:
+            pass
+
+    return recent
+
+def get_git_info():
+    """获取当前目录的Git信息"""
+    try:
+        import subprocess
+        # 检查是否在git仓库中
+        result = subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'],
+                              capture_output=True, text=True, timeout=2)
+        if result.returncode != 0:
+            return None
+
+        # 获取分支名
+        result = subprocess.run(['git', 'branch', '--show-current'],
+                              capture_output=True, text=True, timeout=2)
+        branch = result.stdout.strip() if result.returncode == 0 else "unknown"
+
+        # 获取状态（简短）
+        result = subprocess.run(['git', 'status', '--porcelain'],
+                              capture_output=True, text=True, timeout=2)
+        changes = len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
+
+        return {"branch": branch, "changes": changes}
+    except:
+        return None
 
 def print_header():
-    """打印欢迎信息"""
-    # ASCII Logo
-    for line in LOGO.strip().split('\n'):
-        print(colored(line, Color.MAGENTA))
+    """打印欢迎信息 - Claude Code 风格带边框窗口"""
+    import re
+    import shutil
 
-    # 版本和链接
-    print(colored("  v5.0", Color.DIM) + colored("  ·  ", Color.DIM) + colored("nexusai.aihang365.com", Color.CYAN))
-    print(colored(f"  {get_tip()}", Color.DIM))
+    # 获取终端宽度（多种方式尝试）
+    term_width = 80
+    try:
+        # 方法1: shutil（最可靠）
+        size = shutil.get_terminal_size()
+        term_width = size.columns
+    except:
+        pass
+
+    # 方法2: 环境变量备选
+    if term_width <= 0:
+        term_width = int(os.environ.get('COLUMNS', 80))
+
+    # 方法3: tput (macOS/Linux)
+    if term_width == 80:  # 可能是默认值，尝试 tput
+        try:
+            import subprocess
+            result = subprocess.run(['tput', 'cols'], capture_output=True, text=True, timeout=1)
+            if result.returncode == 0 and result.stdout.strip().isdigit():
+                term_width = int(result.stdout.strip())
+        except:
+            pass
+
+    # Logo固定宽度46字符，计算右侧面板宽度
+    logo_width = 46
+    # 内容宽度 = 终端宽度 - 2(左右边框) - 1(中间分隔)
+    inner_width = term_width - 3
+    left_width = logo_width
+    right_width = inner_width - left_width
+
+    # 如果终端太窄，不显示右侧面板
+    show_right_panel = right_width >= 20
+
+    if not show_right_panel:
+        # 窄屏模式：只显示Logo
+        inner_width = logo_width
+        left_width = logo_width
+        right_width = 0
+
+    # 获取数据
+    recent = get_recent_sessions(2)
+    tip = get_tip()
+    git_info = get_git_info()
+    cwd = os.getcwd()
+
+    # 边框字符
+    TL, TR, BL, BR = '╭', '╮', '╰', '╯'
+    H, V = '─', '│'
+    VL, VR, TD, TU = '├', '┤', '┬', '┴'
+
+    def visible_len(s):
+        """计算去除ANSI码后的可见长度（考虑中文宽字符）"""
+        # 去除ANSI转义码
+        text = re.sub(r'\x1b\[[0-9;]*m', '', str(s))
+        width = 0
+        for char in text:
+            code = ord(char)
+            # 中文和全角字符占2格
+            if (0x4E00 <= code <= 0x9FFF or    # CJK统一汉字
+                0x3000 <= code <= 0x303F or    # CJK标点
+                0xFF00 <= code <= 0xFFEF):     # 全角字符
+                width += 2
+            else:
+                width += 1
+        return width
+
+    def pad_right(text, width):
+        """右侧填充到指定宽度"""
+        vlen = visible_len(text)
+        return text + " " * max(0, width - vlen)
+
+    # 构建右侧内容
+    right_lines = []
+    if show_right_panel:
+        max_text_len = right_width - 3  # 留出边距
+
+        # 当前目录 (用 > 代替 emoji，避免宽度问题)
+        cwd_short = cwd if len(cwd) <= max_text_len - 2 else "..." + cwd[-(max_text_len-5):]
+        right_lines.append(colored("> ", Color.YELLOW) + colored(cwd_short, Color.DIM))
+
+        # Git 信息
+        if git_info:
+            branch = git_info['branch'][:max_text_len-10]
+            git_str = f"* {branch}"
+            if git_info['changes'] > 0:
+                git_str += f" ({git_info['changes']} changed)"
+            right_lines.append(colored(git_str, Color.GREEN))
+        else:
+            right_lines.append(colored("* (not a git repo)", Color.DIM))
+
+        # 空行
+        right_lines.append("")
+
+        # 最近会话
+        right_lines.append(colored("Recent Sessions", Color.BOLD))
+        if recent:
+            for r in recent[:2]:
+                session_text = f"  {r[0]} {r[1][:max_text_len-14]}"
+                right_lines.append(colored(session_text, Color.DIM))
+        else:
+            right_lines.append(colored("  (no recent sessions)", Color.DIM))
+            right_lines.append("")
+
+        # 补齐行数
+        while len(right_lines) < 6:
+            right_lines.append("")
+
+    # 顶部边框
+    if show_right_panel:
+        print(colored(TL + H * left_width + TD + H * right_width + TR, Color.DIM))
+    else:
+        print(colored(TL + H * inner_width + TR, Color.DIM))
+
+    # Logo区域（左侧）+ 信息（右侧）
+    for i, logo_line in enumerate(LOGO_LINES):
+        # 左侧：Logo
+        left_content = " " + colored(logo_line, Color.MAGENTA)
+        left_content = pad_right(left_content, left_width)
+
+        if show_right_panel:
+            # 右侧：内容
+            right_text = right_lines[i] if i < len(right_lines) else ""
+            right_content = " " + right_text
+            right_content = pad_right(right_content, right_width)
+            print(colored(V, Color.DIM) + left_content + colored(V, Color.DIM) + right_content + colored(V, Color.DIM))
+        else:
+            print(colored(V, Color.DIM) + left_content + colored(V, Color.DIM))
+
+    # 分隔线
+    total_inner = left_width + right_width + (1 if show_right_panel else 0)
+    if show_right_panel:
+        print(colored(VL + H * left_width + TU + H * right_width + VR, Color.DIM))
+    else:
+        print(colored(VL + H * inner_width + VR, Color.DIM))
+
+    # Tip 行 (用 * 代替 emoji)
+    tip_max = total_inner - 4
+    tip_line = colored(" * ", Color.YELLOW) + colored(tip[:tip_max], Color.DIM)
+    tip_line = pad_right(tip_line, total_inner)
+    print(colored(V, Color.DIM) + tip_line + colored(V, Color.DIM))
+
+    # 分隔线
+    print(colored(VL + H * total_inner + VR, Color.DIM))
+
+    # 底部信息行
+    info_text = " v5.0  ·  nexusai.aihang365.com  ·  /help for commands "
+    info_line = pad_right(colored(info_text, Color.CYAN), total_inner)
+    print(colored(V, Color.DIM) + info_line + colored(V, Color.DIM))
+
+    # 底部边框
+    print(colored(BL + H * total_inner + BR, Color.DIM))
     print()
 
 def print_help():
@@ -601,7 +814,8 @@ def official_api_request(messages, model, tools=None, api_key=None):
             if "text" in part:
                 return {"type": "text", "content": part["text"]}, None
 
-        return None, "[错误] 无法解析响应"
+        # 调试：打印实际响应结构
+        return None, f"[错误] 无法解析响应: {json.dumps(response_data, ensure_ascii=False)[:500]}"
 
     except subprocess.TimeoutExpired:
         return None, "[超时]: 官方API请求超过60秒"
@@ -669,7 +883,8 @@ def openai_tools_request(messages, model, tools, backend_config, retry=2):
         if content:
             return {"type": "text", "content": content}, None
 
-        return None, "[错误] 无法解析响应"
+        # 调试：打印实际响应结构
+        return None, f"[错误] 无法解析响应: {json.dumps(response_data, ensure_ascii=False)[:500]}"
 
     except subprocess.TimeoutExpired:
         return None, "[超时]: 请求超过120秒"
@@ -1066,8 +1281,9 @@ def interactive_mode(model, backend_name, continue_session=False):
     model = resolve_model(model)
     messages = []
     loaded_file = None
-    # 默认启用文件读写工具
-    enabled_tools = [BUILTIN_TOOLS["read"], BUILTIN_TOOLS["write"]]
+    # 默认不启用工具，避免普通消息走工具调用路径
+    # 用户可通过 /tools add read 手动启用
+    enabled_tools = []
     use_stream = True   # 默认启用流式输出
 
     # 如果是继续会话模式，尝试加载最近的历史
@@ -1293,7 +1509,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                 elif cmd == 'model':
                     if cmd_arg:
                         model = resolve_model(cmd_arg)
-                        print(colored(f"模型已切换到: {model}", Color.GREEN))
+                        print(colored(f"→ {model}", Color.GREEN))
                     else:
                         print(f"当前模型: {model}")
                         print(f"可用模型: flash, pro, pro3")
@@ -1301,23 +1517,15 @@ def interactive_mode(model, backend_name, continue_session=False):
                     if cmd_arg and cmd_arg in BACKENDS:
                         backend_name = cmd_arg
                         backend_config = BACKENDS[backend_name]
-                        print(colored(f"后端已切换到: {backend_config['name']}", Color.GREEN))
+                        print(colored(f"→ {backend_name}", Color.GREEN))
                     else:
                         print(f"当前后端: {backend_config['name']}")
                         print(f"可用后端: {', '.join(BACKENDS.keys())}")
                 elif cmd == 'status':
-                    print(f"模型: {model}")
-                    print(f"后端: {backend_config['name']}")
-                    print(f"对话轮数: {len(messages) // 2}")
-                    print(f"流式输出: {'开启' if use_stream else '关闭'}")
-                    if enabled_tools:
-                        print(f"启用工具: {', '.join([t['name'] for t in enabled_tools])}")
-                        if backend_config.get("supports_tools"):
-                            print(colored("  💡 当前后端支持 Function Calling", Color.GREEN))
-                        else:
-                            print(colored("  ⚠️  当前后端不支持工具调用，请切换到 google 后端", Color.YELLOW))
-                    else:
-                        print(f"启用工具: 无")
+                    turns = len(messages) // 2
+                    stream_status = "on" if use_stream else "off"
+                    tools_status = ', '.join([t['name'] for t in enabled_tools]) if enabled_tools else "-"
+                    print(colored(f"  {model}  ·  {turns} turns  ·  stream {stream_status}  ·  tools: {tools_status}", Color.DIM))
                 elif cmd == 'sessions':
                     # 列出所有会话
                     sessions = list_sessions()
@@ -1394,55 +1602,50 @@ def interactive_mode(model, backend_name, continue_session=False):
                 elif cmd == 'stream':
                     # 切换流式输出
                     use_stream = not use_stream
-                    print(colored(f"流式输出: {'开启' if use_stream else '关闭'}", Color.GREEN))
+                    print(colored(f"→ stream {'on' if use_stream else 'off'}", Color.GREEN))
                 elif cmd == 'tools':
                     if not cmd_arg:
                         # 列出当前启用的工具
                         if enabled_tools:
-                            print(colored("当前启用的工具:", Color.GREEN))
-                            for t in enabled_tools:
-                                print(f"  🔧 {t['name']}: {t['description']}")
+                            names = [t['name'] for t in enabled_tools]
+                            print(colored(f"→ tools: {', '.join(names)}", Color.GREEN))
                         else:
-                            print(colored("当前没有启用任何工具", Color.YELLOW))
-                            print("使用 /tools add <name> 添加工具，可用: " + ", ".join(BUILTIN_TOOLS.keys()))
+                            print(colored("→ tools: none", Color.DIM))
+                            print(colored(f"  available: {', '.join(BUILTIN_TOOLS.keys())}", Color.DIM))
                     else:
                         parts = cmd_arg.split(maxsplit=1)
                         subcmd = parts[0].lower()
                         subarg = parts[1] if len(parts) > 1 else None
 
                         if subcmd == 'list':
-                            print(colored("可用工具:", Color.GREEN))
                             for name, tool in BUILTIN_TOOLS.items():
-                                status = "✅" if any(t['name'] == tool['name'] for t in enabled_tools) else "  "
-                                print(f"  {status} {name}: {tool['description']}")
+                                status = "+" if any(t['name'] == tool['name'] for t in enabled_tools) else " "
+                                print(colored(f"  {status} {name}", Color.GREEN if status == "+" else Color.DIM))
                         elif subcmd == 'add':
                             if subarg and subarg in BUILTIN_TOOLS:
                                 tool = BUILTIN_TOOLS[subarg]
                                 if not any(t['name'] == tool['name'] for t in enabled_tools):
                                     enabled_tools.append(tool)
-                                    print(colored(f"✅ 已添加工具: {tool['name']}", Color.GREEN))
-                                    print(colored("   💡 启用工具后会自动使用官方API进行Function Calling", Color.YELLOW))
+                                    print(colored(f"+ {tool['name']}", Color.GREEN))
                                 else:
-                                    print(colored(f"工具 {subarg} 已经启用", Color.YELLOW))
+                                    print(colored(f"  {subarg} already enabled", Color.DIM))
                             else:
-                                print(f"未知工具: {subarg}")
-                                print("可用工具: " + ", ".join(BUILTIN_TOOLS.keys()))
+                                print(colored(f"  unknown: {subarg}", Color.RED))
                         elif subcmd == 'remove':
                             if subarg:
                                 tool = BUILTIN_TOOLS.get(subarg)
                                 if tool:
                                     enabled_tools = [t for t in enabled_tools if t['name'] != tool['name']]
-                                    print(colored(f"❌ 已移除工具: {tool['name']}", Color.YELLOW))
+                                    print(colored(f"- {tool['name']}", Color.YELLOW))
                                 else:
-                                    print(f"未知工具: {subarg}")
+                                    print(colored(f"  unknown: {subarg}", Color.RED))
                             else:
-                                print("用法: /tools remove <name>")
+                                print(colored("  usage: /tools remove <name>", Color.DIM))
                         elif subcmd == 'clear':
                             enabled_tools = []
-                            print(colored("已清空所有工具", Color.YELLOW))
+                            print(colored("→ tools cleared", Color.YELLOW))
                         else:
-                            print(f"未知子命令: {subcmd}")
-                            print("用法: /tools [list|add|remove|clear]")
+                            print(colored("  usage: /tools [list|add|remove|clear]", Color.DIM))
                 elif cmd == 'call':
                     # 强制使用官方API进行Function Calling
                     if not cmd_arg:
@@ -1512,7 +1715,7 @@ def interactive_mode(model, backend_name, continue_session=False):
                         else:
                             print(colored("用法: /mode [normal|box]", Color.YELLOW))
                             continue
-                    print(colored(f"输入模式已切换到: {input_mode}", Color.GREEN))
+                    print(colored(f"→ {input_mode}", Color.GREEN))
                 elif cmd in {'img', 'image'}:
                     try:
                         parts = shlex.split(user_input, posix=True)
