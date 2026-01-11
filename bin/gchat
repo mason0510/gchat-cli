@@ -165,6 +165,8 @@ class Color:
     YELLOW = '\033[93m'
     RED = '\033[91m'
     CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    DIM = '\033[2m'
     BOLD = '\033[1m'
     END = '\033[0m'
 
@@ -345,13 +347,22 @@ def normalize_messages_for_api(messages: list[dict]) -> list[dict]:
     return out
 
 def print_header():
-    """打印欢迎信息"""
-    print(colored("╔════════════════════════════════════════╗", Color.CYAN))
-    print(colored("║       Gemini Chat CLI v1.0             ║", Color.CYAN))
-    print(colored("║  /help 查看命令  /quit 退出            ║", Color.CYAN))
-    print(colored("║  /paste 多行输入；/mode 切换输入框模式  ║", Color.CYAN))
-    print(colored("╚════════════════════════════════════════╝", Color.CYAN))
+    """打印欢迎信息 - 现代极简风格"""
+    # 1. 品牌层 (Brand & Version)
+    print(colored("✦ NexusAI CLI", Color.BOLD + Color.CYAN) + colored(" v4.0", Color.DIM))
     print()
+
+    # 2. 状态层 (Status Context) - 由调用方动态填充
+    # print(colored("○", Color.DIM) + " Status: " + colored("Ready to chat", Color.GREEN))
+    # print(colored("○", Color.DIM) + " Mode:   Default" + colored(" (Multi-line: /paste)", Color.DIM))
+    # print(colored("○", Color.DIM) + " Back:   Google API" + colored(" (Functional)", Color.DIM))
+    # print()
+
+    # 3. 引导层 (Hints)
+    print(colored("Type", Color.DIM) + " /help " + colored("for commands or", Color.DIM) + " /quit " + colored("to exit.", Color.DIM))
+
+    # 分隔线
+    print(colored("—", Color.DIM))
 
 def print_help():
     """打印帮助信息"""
@@ -738,16 +749,16 @@ def interactive_mode(model, backend_name, continue_session=False):
             messages = loaded_messages
             if loaded_model:
                 model = loaded_model
-            print(colored(f"📂 已加载会话: {loaded_file}", Color.GREEN))
-            print(colored(f"   共 {len(messages)} 条消息 ({len(messages)//2} 轮对话)", Color.GREEN))
+            print(colored("○", Color.DIM) + f" Loaded: {colored(loaded_file, Color.DIM)}")
+            print(colored("○", Color.DIM) + f" Messages: {colored(f'{len(messages)} ({len(messages)//2} turns)', Color.DIM)}")
             print()
 
     print_header()
-    print(f"模型: {colored(model, Color.GREEN)}  后端: {colored(backend_config['name'], Color.BLUE)}")
-    if continue_session and loaded_file:
-        print(f"会话: {colored('继续上次对话', Color.YELLOW)}")
-    else:
-        print(f"会话: {colored('新对话', Color.YELLOW)}")
+    # 状态层 (Status Context)
+    print(colored("○", Color.DIM) + f" Model: {colored(model, Color.CYAN)}")
+    print(colored("○", Color.DIM) + f" Backend: {colored(backend_config['name'], Color.DIM)}")
+    session_status = 'Continuing' if (continue_session and loaded_file) else 'New'
+    print(colored("○", Color.DIM) + f" Session: {colored(session_status, Color.GREEN)}")
     print()
 
     input_mode = 'normal'  # normal | box
@@ -759,7 +770,9 @@ def interactive_mode(model, backend_name, continue_session=False):
             history = None
 
     def prompt_text() -> str:
-        return colored("You[box]> ", Color.BOLD) if input_mode == 'box' else colored("You> ", Color.BOLD)
+        if input_mode == 'box':
+            return colored("◆ You[box] › ", Color.MAGENTA + Color.BOLD)
+        return colored("◆ You › ", Color.MAGENTA + Color.BOLD)
 
     def read_user_message(force_box: bool = False, default_text: str = "") -> str | None:
         """读取用户输入。
