@@ -763,9 +763,9 @@ def interactive_mode(model, backend_name, continue_session=False):
 
     input_mode = 'normal'  # normal | box
     history = None
-    # 检查终端可用性
-    is_interactive = sys.stdin.isatty()
-    if pt_prompt and FileHistory and is_interactive:
+    # 检查终端可用性 - 同时检查 stdin 和 stdout
+    is_interactive = sys.stdin.isatty() or sys.stdout.isatty()
+    if pt_prompt and FileHistory:
         try:
             history = FileHistory(get_input_history_path())
         except Exception:
@@ -784,7 +784,7 @@ def interactive_mode(model, backend_name, continue_session=False):
         """
         use_box = force_box or (input_mode == 'box')
 
-        if pt_prompt and KeyBindings and is_interactive:
+        if pt_prompt and KeyBindings:
             kb = KeyBindings()
             cancel_token = "__CANCEL__"
 
