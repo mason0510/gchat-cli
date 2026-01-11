@@ -464,9 +464,23 @@ def get_tip():
     return TIPS[idx]
 
 
+LOGO = r"""
+   ██████╗  ██████╗██╗  ██╗ █████╗ ████████╗
+  ██╔════╝ ██╔════╝██║  ██║██╔══██╗╚══██╔══╝
+  ██║  ███╗██║     ███████║███████║   ██║
+  ██║   ██║██║     ██╔══██║██╔══██║   ██║
+  ╚██████╔╝╚██████╗██║  ██║██║  ██║   ██║
+   ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝
+"""
+
 def print_header():
     """打印欢迎信息"""
-    print(colored("  gchat", Color.BOLD + Color.MAGENTA) + colored(" v5.0", Color.DIM) + colored("  nexusai.aihang365.com", Color.DIM))
+    # ASCII Logo
+    for line in LOGO.strip().split('\n'):
+        print(colored(line, Color.MAGENTA))
+
+    # 版本和链接
+    print(colored("  v5.0", Color.DIM) + colored("  ·  ", Color.DIM) + colored("nexusai.aihang365.com", Color.CYAN))
     print(colored(f"  {get_tip()}", Color.DIM))
     print()
 
