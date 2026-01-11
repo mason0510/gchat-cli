@@ -1156,6 +1156,10 @@ def chat_request_stream(messages, model, backend_config, debug=False, show_spinn
 
     spinner = StatusSpinner() if show_spinner else None
 
+    # 耗时统计
+    start_time = time.time()
+    ttfb_time = None  # Time to First Byte
+
     try:
         if spinner:
             spinner.start()
@@ -1191,6 +1195,7 @@ def chat_request_stream(messages, model, backend_config, debug=False, show_spinn
                         if content:
                             if first_content and spinner:
                                 spinner.stop()
+                                ttfb_time = time.time() - start_time
                                 first_content = False
                             print(content, end="", flush=True)
                             full_response += content
@@ -1215,6 +1220,10 @@ def chat_request_stream(messages, model, backend_config, debug=False, show_spinn
 
         if full_response:
             print()  # 换行
+            # 显示耗时统计
+            total_time = time.time() - start_time
+            ttfb_str = f"{ttfb_time:.1f}s" if ttfb_time else "N/A"
+            print(colored(f"  ⏱ TTFB: {ttfb_str} | Total: {total_time:.1f}s", Color.DIM))
         return full_response if full_response else "[无响应]"
 
     except Exception as e:
