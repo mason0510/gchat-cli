@@ -27,6 +27,7 @@ import signal
 import glob as glob_module
 import threading
 import time
+import random
 from pathlib import Path
 
 from wcwidth import wcswidth, wcwidth
@@ -412,9 +413,23 @@ class StatusSpinner:
         sys.stdout.flush()
 
 
+TIPS = [
+    "git commit -m 'fix bug' 后发现还有 bug，是宿命。",
+    "代码能跑就不要动。除非你想加班。",
+    "没有什么 bug 是重启解决不了的，如果有，就重装。",
+    "今天的你写的代码，明天的你看不懂。",
+    "与其优化代码，不如优化需求。",
+    "deadline 是第一生产力。",
+    "好的代码自己会说话，坏的代码需要注释。",
+    "先让它工作，再让它正确，最后让它快。",
+    "一个 TODO 放三年，就成了 TODON'T。",
+    "If it works, don't touch it.",
+]
+
 def print_header():
     """打印欢迎信息"""
-    print(colored("  gchat", Color.BOLD + Color.MAGENTA) + colored(" v5.0", Color.DIM))
+    print(colored("  gchat", Color.BOLD + Color.MAGENTA) + colored(" v5.0", Color.DIM) + colored("  nexusai.aihang365.com", Color.DIM))
+    print(colored(f"  {random.choice(TIPS)}", Color.DIM))
     print()
 
 def print_help():
