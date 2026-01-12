@@ -313,6 +313,7 @@ def encode_image_to_data_url(path: Path) -> str:
 def extract_local_image_paths(text: str) -> tuple[str, list[Path]]:
     """从用户输入中提取本地图片路径（用于拖拽文件到终端场景）。
 
+    支持带空格的路径（如 /path/to/图片 1.png 文字描述）
     - 仅当 token 指向真实存在的文件且扩展名是图片时才认定为图片。
     - 返回：移除图片路径后的文本 + 图片路径列表
     """
@@ -328,12 +329,43 @@ def extract_local_image_paths(text: str) -> tuple[str, list[Path]]:
 
     image_paths: list[Path] = []
     remaining: list[str] = []
-    for tok in tokens:
-        p = Path(tok).expanduser()
-        if is_image_file(p):
-            image_paths.append(p)
-        else:
-            remaining.append(tok)
+    i = 0
+
+    while i < len(tokens):
+        tok = tokens[i]
+
+        # 如果 token 以 / 开头，可能是路径的开始
+        if tok.startswith('/'):
+            # 尝试贪婪地合并后面的 tokens，直到找到有效的图片文件
+            found_image = None
+            merged_count = 0
+
+            for j in range(i, len(tokens)):
+                # 检查合并到 tokens[j] 是否形成有效图片路径
+                candidate = ' '.join(tokens[i:j+1])
+                p = Path(candidate).expanduser()
+
+                if is_image_file(p):
+                    found_image = p
+                    merged_count = j - i + 1
+                    break
+
+                # 如果 tokens[j] 已经看起来是独立的词（空格分隔的文字描述），停止合并
+                # 判断依据：不包含 / 且不像是文件扩展名
+                if '/' not in tokens[j] and not tokens[j].startswith('.'):
+                    # 但还要检查这个 token 是否可能是文件名的一部分（如 "1.png"）
+                    if '.' not in tokens[j] or len(tokens[j].split('.')[-1]) < 2:
+                        # 不太可能是文件扩展名，可能是普通文字
+                        break
+
+            if found_image:
+                image_paths.append(found_image)
+                i += merged_count
+                continue
+
+        # 不是图片路径，加入 remaining
+        remaining.append(tok)
+        i += 1
 
     cleaned_text = ' '.join(remaining).strip()
     return cleaned_text, image_paths
@@ -825,29 +857,29 @@ def print_help():
     """打印帮助信息 - Claude Code 风格"""
     sections = [
         ("Commands", [
-            ("/help", "show help"),
-            ("/quit", "exit (auto-save)"),
-            ("/clear", "clear chat history"),
-            ("/history", "show chat history"),
+            (":help", "show help"),
+            (":quit", "exit (auto-save)"),
+            (":clear", "clear chat history"),
+            (":history", "show chat history"),
         ]),
         ("Files", [
-            ("/read <file>", "read file for AI analysis"),
-            ("/write <file>", "save last AI reply to file"),
-            ("/img <path>", "analyze image"),
+            (":read <file>", "read file for AI analysis"),
+            (":write <file>", "save last AI reply to file"),
+            (":img <path>", "analyze image"),
         ]),
         ("Sessions", [
-            ("/sessions", "list saved sessions"),
-            ("/save <file>", "save chat manually"),
-            ("/load <file>", "load chat"),
+            (":sessions", "list saved sessions"),
+            (":save <file>", "save chat manually"),
+            (":load <file>", "load chat"),
         ]),
         ("Settings", [
-            ("/model <name>", "switch model (flash/pro/pro3)"),
-            ("/backend <name>", "switch backend"),
-            ("/stream", "toggle streaming"),
-            ("/spinner", "toggle spinner animation"),
-            ("/mode [box]", "toggle input mode"),
-            ("/prefs [edit]", "manage preferences (GCHAT.md)"),
-            ("/status", "show current status"),
+            (":model <name>", "switch model (flash/pro/pro3)"),
+            (":backend <name>", "switch backend"),
+            (":stream", "toggle streaming"),
+            (":spinner", "toggle spinner animation"),
+            (":mode [box]", "toggle input mode"),
+            (":prefs [edit]", "manage preferences (GCHAT.md)"),
+            (":status", "show current status"),
         ]),
     ]
 
@@ -1470,17 +1502,22 @@ def interactive_mode(model, backend_name, continue_session=False):
             return colored("› ", Color.MAGENTA + Color.BOLD) + colored("[box] ", Color.DIM)
         return colored("› ", Color.MAGENTA + Color.BOLD)
 
-    def read_user_message(force_box: bool = False, default_text: str = "") -> str | None:
-        """读取用户输入。
+    # 粘贴计数器（用于显示 [Pasted text #1 +N lines]）
+    paste_counter = [0]
+    # 图片附件状态
+    image_attachment = {"path": None, "selected": False}
 
-        - normal: 单行 Enter 发送；如果内容已包含换行（常见于粘贴），Enter 继续换行，Ctrl+S 发送
-        - box: 多行输入框；Enter 换行，Ctrl+S 发送，Ctrl+G 取消
-        """
+    def read_user_message(force_box: bool = False, default_text: str = "") -> str | None:
+        """读取用户输入。Claude Code 风格：支持图片附件预览。"""
         use_box = force_box or (input_mode == 'box')
 
         if pt_prompt and KeyBindings:
             kb = KeyBindings()
             cancel_token = "__CANCEL__"
+
+            # 重置图片状态
+            image_attachment["path"] = None
+            image_attachment["selected"] = False
 
             @kb.add('c-g')
             def _(event):
@@ -1498,21 +1535,31 @@ def interactive_mode(model, backend_name, continue_session=False):
             def _(event):
                 event.current_buffer.validate_and_handle()
 
+            # 图片选择：↑ 选择图片，↓ 取消选择
+            @kb.add('up')
+            def _(event):
+                if image_attachment["path"]:
+                    image_attachment["selected"] = True
+                    # 刷新界面
+                    if hasattr(event.app, 'renderer'):
+                        event.app.renderer.clear()
+
+            @kb.add('down')
+            def _(event):
+                if image_attachment["path"]:
+                    image_attachment["selected"] = False
+                    # 刷新界面
+                    if hasattr(event.app, 'renderer'):
+                        event.app.renderer.clear()
+
             @kb.add('enter')
             def _(event):
                 buf = event.current_buffer
                 text = buf.text
 
+                # Claude Code 风格：行末 \ 继续换行，否则 Enter 直接发送
                 if text.endswith('\\'):
                     buf.delete_before_cursor(count=1)
-                    buf.insert_text('\n')
-                    return
-
-                if use_box:
-                    buf.insert_text('\n')
-                    return
-
-                if '\n' in text:
                     buf.insert_text('\n')
                     return
 
@@ -1521,16 +1568,30 @@ def interactive_mode(model, backend_name, continue_session=False):
             prompt_obj = PTANSI(prompt_text()) if PTANSI else prompt_text()
 
             # 占位提示文字
-            placeholder_text = HTML('<style fg="ansibrightblack">Type message or /help for commands</style>') if HTML else None
+            placeholder_text = HTML('<style fg="ansibrightblack">Type message or :help for commands</style>') if HTML else None
 
-            # 底部状态栏
+            # 底部状态栏（包含图片信息）
             def get_toolbar():
                 msg_count = len(messages)
                 turns = msg_count // 2
                 stream_status = "stream on" if use_stream else "stream off"
-                return HTML(f'<style fg="ansibrightblack">  {model}  ·  {turns} turns  ·  {stream_status}</style>')
+
+                # 图片信息
+                image_info = ""
+                if image_attachment["path"]:
+                    filename = Path(image_attachment["path"]).name
+                    status = "✓" if image_attachment["selected"] else " "
+                    image_info = f"  [{status} Image: {filename} (↑/↓ to toggle)]"
+
+                return HTML(f'<style fg="ansibrightblack">  {model}  ·  {turns} turns  ·  {stream_status}{image_info}</style>')
 
             toolbar_func = get_toolbar if HTML else None
+
+            # 实时刷新的 rprompt（显示图片提示）
+            def get_rprompt():
+                if image_attachment["path"] and not image_attachment["selected"]:
+                    return "按↑ to select"
+                return None
 
             try:
                 text = pt_prompt(
@@ -1542,12 +1603,20 @@ def interactive_mode(model, backend_name, continue_session=False):
                     wrap_lines=True,
                     placeholder=placeholder_text,
                     bottom_toolbar=toolbar_func,
+                    rprompt=get_rprompt,
                 )
             except KeyboardInterrupt:
                 return None
             if text == cancel_token:
                 return None
-            return sanitize_terminal_paste(text)
+
+            text = sanitize_terminal_paste(text)
+
+            # 如果有选中的图片，在文本末尾添加图片标记
+            if image_attachment["selected"] and image_attachment["path"]:
+                text = text + f" [Image: {image_attachment['path']}]"
+
+            return text
 
         prompt = readline_safe_prompt(prompt_text())
         cont_prompt = readline_safe_prompt(colored("...> ", Color.BOLD))
@@ -1612,9 +1681,17 @@ def interactive_mode(model, backend_name, continue_session=False):
             if user_input_raw is None:
                 continue
 
+            # 提取图片附件 [Image: /path/to/image.png]
+            import re
+            image_match = re.search(r'\[Image:\s*(.+?)\]', user_input_raw)
+            image_path = None
+            if image_match:
+                image_path = image_match.group(1).strip()
+                user_input_raw = re.sub(r'\s*\[Image:\s*.+?\]', '', user_input_raw)
+
             user_input = user_input_raw.strip()
 
-            if user_input == '/paste':
+            if user_input == ':paste':
                 pasted = read_user_message(force_box=True)
                 if pasted is None:
                     continue
@@ -1624,8 +1701,9 @@ def interactive_mode(model, backend_name, continue_session=False):
             if not user_input:
                 continue
 
-            # 处理命令
-            if user_input.startswith('/'):
+            # 处理命令（以 : 开头）
+            # 文件路径以 / 开头，不再冲突
+            if user_input.startswith(':'):
                 cmd_parts = user_input[1:].split(maxsplit=1)
                 cmd = cmd_parts[0].lower()
                 cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else None
@@ -1954,11 +2032,16 @@ def interactive_mode(model, backend_name, continue_session=False):
                     print()
                     messages.append({"role": "assistant", "content": response})
                 else:
-                    print(colored(f"未知命令: /{cmd}，输入 /help 查看帮助", Color.RED))
+                    print(colored(f"未知命令: :{cmd}，输入 :help 查看帮助", Color.RED))
                 continue
 
-            # 图片：支持直接拖拽图片路径到输入框
+            # 图片：支持直接拖拽图片路径到输入框，或通过 [Image: ...] 标记
             cleaned_text, image_paths = extract_local_image_paths(user_input)
+
+            # 如果有通过方向键选择的图片
+            if image_path:
+                image_paths.insert(0, Path(image_path))
+
             if image_paths:
                 user_text = cleaned_text or "请描述这张图片。"
                 confirmed_text = maybe_confirm_box(user_text)
