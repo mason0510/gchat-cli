@@ -336,27 +336,19 @@ def extract_local_image_paths(text: str) -> tuple[str, list[Path]]:
 
         # 如果 token 以 / 开头，可能是路径的开始
         if tok.startswith('/'):
-            # 尝试贪婪地合并后面的 tokens，直到找到有效的图片文件
+            # 贪婪地尝试合并后续所有 tokens，找到最长的有效图片路径
             found_image = None
             merged_count = 0
 
+            # 尝试从当前位置开始的所有可能的合并长度
             for j in range(i, len(tokens)):
-                # 检查合并到 tokens[j] 是否形成有效图片路径
                 candidate = ' '.join(tokens[i:j+1])
                 p = Path(candidate).expanduser()
 
                 if is_image_file(p):
+                    # 找到有效图片，更新为最长匹配（继续尝试更长的组合）
                     found_image = p
                     merged_count = j - i + 1
-                    break
-
-                # 如果 tokens[j] 已经看起来是独立的词（空格分隔的文字描述），停止合并
-                # 判断依据：不包含 / 且不像是文件扩展名
-                if '/' not in tokens[j] and not tokens[j].startswith('.'):
-                    # 但还要检查这个 token 是否可能是文件名的一部分（如 "1.png"）
-                    if '.' not in tokens[j] or len(tokens[j].split('.')[-1]) < 2:
-                        # 不太可能是文件扩展名，可能是普通文字
-                        break
 
             if found_image:
                 image_paths.append(found_image)
@@ -855,6 +847,7 @@ def print_header():
 
 def print_help():
     """打印帮助信息 - Claude Code 风格"""
+    print(colored("\n命令前缀: 支持 : 或 / (例如 :help 或 /help)\n", Color.CYAN))
     sections = [
         ("Commands", [
             (":help", "show help"),
@@ -1691,7 +1684,7 @@ def interactive_mode(model, backend_name, continue_session=False):
 
             user_input = user_input_raw.strip()
 
-            if user_input == ':paste':
+            if user_input in [':paste', '/paste']:
                 pasted = read_user_message(force_box=True)
                 if pasted is None:
                     continue
@@ -1701,9 +1694,23 @@ def interactive_mode(model, backend_name, continue_session=False):
             if not user_input:
                 continue
 
-            # 处理命令（以 : 开头）
-            # 文件路径以 / 开头，不再冲突
+            # 处理命令（以 : 或 / 开头）
+            # 为了区分命令和文件路径，检查是否是有效命令
+            is_command = False
+            cmd_prefix = None
+
             if user_input.startswith(':'):
+                is_command = True
+                cmd_prefix = ':'
+            elif user_input.startswith('/'):
+                # 检查是否是已知命令（而非文件路径）
+                first_word = user_input[1:].split()[0].lower() if len(user_input) > 1 else ''
+                known_commands = ['quit', 'q', 'exit', 'help', 'h', 'clear', 'c', 'history', 'read', 'write', 'img', 'sessions', 'save', 'load', 'model', 'backend', 'stream', 'spinner', 'mode', 'prefs', 'status', 'paste']
+                if first_word in known_commands:
+                    is_command = True
+                    cmd_prefix = '/'
+
+            if is_command:
                 cmd_parts = user_input[1:].split(maxsplit=1)
                 cmd = cmd_parts[0].lower()
                 cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else None
@@ -2000,14 +2007,36 @@ def interactive_mode(model, backend_name, continue_session=False):
                         print(colored("用法: /img <图片路径...> [描述文本]", Color.YELLOW))
                         continue
 
+                    # 使用贪婪合并逻辑处理带空格的图片路径
                     image_paths: list[Path] = []
                     text_parts: list[str] = []
-                    for tok in args:
-                        p = Path(tok).expanduser()
-                        if is_image_file(p):
-                            image_paths.append(p)
-                        else:
-                            text_parts.append(tok)
+                    i = 0
+
+                    while i < len(args):
+                        tok = args[i]
+
+                        # 如果 token 以 / 或 ~ 开头，可能是路径的开始
+                        if tok.startswith('/') or tok.startswith('~'):
+                            # 贪婪地尝试合并后续 tokens，找到最长的有效图片路径
+                            found_image = None
+                            merged_count = 0
+
+                            for j in range(i, len(args)):
+                                candidate = ' '.join(args[i:j+1])
+                                p = Path(candidate).expanduser()
+
+                                if is_image_file(p):
+                                    found_image = p
+                                    merged_count = j - i + 1
+
+                            if found_image:
+                                image_paths.append(found_image)
+                                i += merged_count
+                                continue
+
+                        # 不是图片路径，加入文本部分
+                        text_parts.append(tok)
+                        i += 1
 
                     if not image_paths:
                         print(colored("未检测到有效图片文件（支持 png/jpg/jpeg/webp/gif 等）", Color.YELLOW))
@@ -2123,7 +2152,23 @@ def single_prompt(prompt, model, backend_name, output_json=False, use_stream=Fal
     """单次提问模式"""
     backend_config = BACKENDS[backend_name]
     model = resolve_model(model)
-    messages = [{"role": "user", "content": prompt}]
+
+    # 提取图片路径（支持带空格的路径）
+    cleaned_text, image_paths = extract_local_image_paths(prompt)
+
+    # 构建消息
+    if image_paths:
+        # 多模态消息（包含图片）
+        user_message = {
+            "role": "user",
+            "content": [{"type": "text", "text": cleaned_text or "请分析图片"}] + [
+                {"type": "image_file", "path": str(p)} for p in image_paths
+            ],
+        }
+        messages = [user_message]
+    else:
+        # 纯文本消息
+        messages = [{"role": "user", "content": prompt}]
 
     if use_stream and not output_json:
         response = chat_request_with_fallback_stream(messages, model, backend_config)
@@ -2195,6 +2240,8 @@ def main():
                         help='输出 JSON 格式（用于脚本集成）')
     parser.add_argument('--no-stream', dest='no_stream', action='store_true',
                         help='禁用流式输出')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='安静模式（不显示交互式UI，仅输出结果）')
     parser.add_argument('--list-models', action='store_true',
                         help='列出可用模型和后端')
 
