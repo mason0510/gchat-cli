@@ -1137,7 +1137,7 @@ def resolve_model(model_input):
     return MODEL_ALIASES.get(model_input, model_input)
 
 
-def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=False):
+def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=False, quiet=False):
     """发送聊天请求，失败时自动降级到备用模型"""
     # 第一次尝试：使用主模型
     response = chat_request(messages, model, backend_config, retry=retry, debug=debug)
@@ -1145,9 +1145,10 @@ def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=F
     # 检查是否失败（错误响应以 [ 开头）
     if response.startswith("[") and model in FALLBACK_MODELS:
         fallback_model = FALLBACK_MODELS[model]
-        print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
+        if not quiet:
+            print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
         response = chat_request(messages, fallback_model, backend_config, retry=retry, debug=debug)
-        if not response.startswith("["):
+        if not response.startswith("[") and not quiet:
             print(f"✅ 降级成功，使用 {fallback_model} 响应\n")
 
     return response
@@ -1261,13 +1262,14 @@ def chat_request_stream(messages, model, backend_config, debug=False, show_spinn
             spinner.stop()
 
 
-def chat_request_with_fallback_stream(messages, model, backend_config, debug=False, show_spinner=True):
+def chat_request_with_fallback_stream(messages, model, backend_config, debug=False, show_spinner=True, quiet=False):
     """流式请求，失败时降级"""
     response = chat_request_stream(messages, model, backend_config, debug=debug, show_spinner=show_spinner)
 
     if response.startswith("[") and model in FALLBACK_MODELS:
         fallback_model = FALLBACK_MODELS[model]
-        print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
+        if not quiet:
+            print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
         response = chat_request_stream(messages, fallback_model, backend_config, debug=debug, show_spinner=show_spinner)
 
     return response
@@ -2171,9 +2173,9 @@ def single_prompt(prompt, model, backend_name, output_json=False, use_stream=Fal
         messages = [{"role": "user", "content": prompt}]
 
     if use_stream and not output_json:
-        response = chat_request_with_fallback_stream(messages, model, backend_config)
+        response = chat_request_with_fallback_stream(messages, model, backend_config, quiet=True)
     else:
-        response = chat_request_with_fallback(messages, model, backend_config)
+        response = chat_request_with_fallback(messages, model, backend_config, quiet=True)
 
     if output_json:
         result = {
