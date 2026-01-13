@@ -1046,7 +1046,7 @@ def openai_tools_request(messages, model, tools, backend_config, retry=2):
         return None, f"[错误]: {e}"
 
 
-def chat_request(messages, model, backend_config, retry=2, debug=False):
+def chat_request(messages, model, backend_config, retry=2, debug=False, show_spinner=True):
     """发送聊天请求（使用curl，兼容性最好）"""
     url = backend_config["url"]
     payload = {
@@ -1075,7 +1075,12 @@ def chat_request(messages, model, backend_config, retry=2, debug=False):
     # 添加请求体
     curl_cmd.extend(['-d', json.dumps(payload)])
 
+    spinner = StatusSpinner() if show_spinner else None
+
     try:
+        if spinner:
+            spinner.start()
+
         # 执行curl命令
         result = subprocess.run(
             curl_cmd,
@@ -1083,6 +1088,9 @@ def chat_request(messages, model, backend_config, retry=2, debug=False):
             text=True,
             timeout=125
         )
+
+        if spinner:
+            spinner.stop()
 
         if result.returncode != 0:
             stderr_msg = result.stderr.strip() if result.stderr else "网络连接失败"
@@ -1126,10 +1134,16 @@ def chat_request(messages, model, backend_config, retry=2, debug=False):
         return response_data["choices"][0]["message"]["content"]
 
     except subprocess.TimeoutExpired:
+        if spinner:
+            spinner.stop()
         return f"[超时]: 请求超过120秒"
     except json.JSONDecodeError as e:
+        if spinner:
+            spinner.stop()
         return f"[JSON解析错误]: {str(e)}\n响应: {result.stdout[:200]}"
     except Exception as e:
+        if spinner:
+            spinner.stop()
         return f"[错误]: {str(e)}"
 
 def resolve_model(model_input):
@@ -1137,17 +1151,17 @@ def resolve_model(model_input):
     return MODEL_ALIASES.get(model_input, model_input)
 
 
-def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=False, quiet=False):
+def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=False, quiet=False, show_spinner=True):
     """发送聊天请求，失败时自动降级到备用模型"""
     # 第一次尝试：使用主模型
-    response = chat_request(messages, model, backend_config, retry=retry, debug=debug)
+    response = chat_request(messages, model, backend_config, retry=retry, debug=debug, show_spinner=show_spinner)
 
     # 检查是否失败（错误响应以 [ 开头）
     if response.startswith("[") and model in FALLBACK_MODELS:
         fallback_model = FALLBACK_MODELS[model]
         if not quiet:
             print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
-        response = chat_request(messages, fallback_model, backend_config, retry=retry, debug=debug)
+        response = chat_request(messages, fallback_model, backend_config, retry=retry, debug=debug, show_spinner=show_spinner)
         if not response.startswith("[") and not quiet:
             print(f"✅ 降级成功，使用 {fallback_model} 响应\n")
 
@@ -2173,9 +2187,9 @@ def single_prompt(prompt, model, backend_name, output_json=False, use_stream=Fal
         messages = [{"role": "user", "content": prompt}]
 
     if use_stream and not output_json:
-        response = chat_request_with_fallback_stream(messages, model, backend_config, quiet=True)
+        response = chat_request_with_fallback_stream(messages, model, backend_config, quiet=True, show_spinner=False)
     else:
-        response = chat_request_with_fallback(messages, model, backend_config, quiet=True)
+        response = chat_request_with_fallback(messages, model, backend_config, quiet=True, show_spinner=False)
 
     if output_json:
         result = {
