@@ -27,6 +27,7 @@ import signal
 import glob as glob_module
 import threading
 import time
+import sqlite3
 from pathlib import Path
 
 from wcwidth import wcswidth, wcwidth
@@ -139,6 +140,29 @@ R2_CONFIG = {
 NEXUSAI_IMAGE_CONFIG = {
     "url": "https://nexusai.aihang365.com/v1/images/generations",
     "key": "sk-BwOEIrmXoy6AL4IwEeBL9FuoPIRIf25I8bhObhGazgBSr2nC",
+}
+
+# GPT-Load 图片生成配置 (首选，Cookie模式无额度限制)
+GPTLOAD_IMAGE_CONFIG = {
+    "url": "https://gpt-load.aihang365.com/proxy/gemini-cookie/v1/images/generations",
+    "key": "Zhxc6545398@",
+}
+
+# ZYAI 图片生成配置 (备用)
+ZYAI_IMAGE_CONFIG = {
+    "url": "https://api.zyai.online/v1beta/models/{model}:generateContent",
+    "key": "sk-pNYQej3gfPbTdpPADbBb837dBcB0454dAe262c13E5E4D65d",
+}
+
+# YUNWU Chat 图片生成配置 (备用，使用chat completions接口)
+YUNWU_IMAGE_CONFIG = {
+    "url": "https://yunwu.zeabur.app/v1/chat/completions",
+    "key": "sk-Y5h8IJXuW9ONMQ4L6s66cWcNfBIMyEI9RhEpEtUnd7UYjUh8",
+}
+
+# Google-API 图片生成配置 (最终降级，Cookie模式)
+GOOGLE_API_IMAGE_CONFIG = {
+    "url": "https://google-api.aihang365.com/v1/chat/completions",
 }
 
 # 预定义的常用工具
@@ -2190,6 +2214,767 @@ def interactive_mode(model, backend_name, continue_session=False):
             print(colored("  bye.", Color.DIM))
             break
 
+
+def upload_to_r2(image_data: bytes, filename: str) -> str:
+    """上传图片到 Cloudflare R2，返回公开URL"""
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError:
+        return "[错误] 需要安装 boto3: pip install boto3"
+
+    s3 = boto3.client(
+        's3',
+        endpoint_url=R2_CONFIG["endpoint"],
+        aws_access_key_id=R2_CONFIG["access_key_id"],
+        aws_secret_access_key=R2_CONFIG["secret_access_key"],
+        config=Config(signature_version='s3v4'),
+        region_name='auto'
+    )
+
+    # 路径格式: nexusai/img/gchat_YYYYMMDD_HHMMSS.png
+    key = f"nexusai/img/{filename}"
+
+    try:
+        s3.put_object(
+            Bucket=R2_CONFIG["bucket"],
+            Key=key,
+            Body=image_data,
+            ContentType='image/png'
+        )
+        return f"{R2_CONFIG['public_url']}/{key}"
+    except Exception as e:
+        return f"[R2上传失败] {e}"
+
+
+def _generate_image_zyai(prompt: str, model: str) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 ZYAI (Gemini Native API) 生成图片"""
+    import urllib.request
+    import urllib.error
+
+    url = ZYAI_IMAGE_CONFIG["url"].replace("{model}", model)
+    headers = {
+        "Authorization": f"Bearer {ZYAI_IMAGE_CONFIG['key']}",
+        "Content-Type": "application/json"
+    }
+    # Gemini Native API 格式
+    data = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # Gemini Native API 响应格式
+            # {"candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "..."}}]}}]}
+            if "candidates" in result:
+                for candidate in result["candidates"]:
+                    parts = candidate.get("content", {}).get("parts", [])
+                    for part in parts:
+                        inline_data = part.get("inlineData", {})
+                        if inline_data.get("data"):
+                            return base64.b64decode(inline_data["data"]), ""
+
+            return None, f"[ZYAI响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[ZYAI HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[ZYAI错误] {e}"
+
+
+def _generate_image_nexusai(prompt: str, model: str) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 NexusAI (OpenAI格式) 生成图片"""
+    import urllib.request
+    import urllib.error
+
+    url = NEXUSAI_IMAGE_CONFIG["url"]
+    headers = {
+        "Authorization": f"Bearer {NEXUSAI_IMAGE_CONFIG['key']}",
+        "Content-Type": "application/json"
+    }
+    data = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "response_format": "b64_json"
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # 格式1: {"images": ["data:image/png;base64,..."]}
+            if "images" in result and len(result["images"]) > 0:
+                data_url = result["images"][0]
+                if data_url.startswith("data:"):
+                    b64_data = data_url.split(",", 1)[1] if "," in data_url else data_url
+                    return base64.b64decode(b64_data), ""
+
+            # 格式2: {"data": [{"b64_json": "..."}]}
+            if "data" in result and len(result["data"]) > 0:
+                b64_data = result["data"][0].get("b64_json")
+                if b64_data:
+                    return base64.b64decode(b64_data), ""
+
+            return None, f"[NexusAI响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[NexusAI HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[NexusAI错误] {e}"
+
+
+def _generate_image_gptload(prompt: str, model: str) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 GPT-Load (Cookie模式，无额度限制) 生成图片"""
+    import urllib.request
+    import urllib.error
+
+    url = GPTLOAD_IMAGE_CONFIG["url"]
+    headers = {
+        "Authorization": f"Bearer {GPTLOAD_IMAGE_CONFIG['key']}",
+        "Content-Type": "application/json"
+    }
+    data = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "response_format": "b64_json"
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # 格式1: {"images": ["data:image/png;base64,..."]}
+            if "images" in result and len(result["images"]) > 0:
+                data_url = result["images"][0]
+                if data_url.startswith("data:"):
+                    b64_data = data_url.split(",", 1)[1] if "," in data_url else data_url
+                    return base64.b64decode(b64_data), ""
+
+            # 格式2: {"data": [{"b64_json": "..."}]}
+            if "data" in result and len(result["data"]) > 0:
+                b64_data = result["data"][0].get("b64_json")
+                if b64_data:
+                    return base64.b64decode(b64_data), ""
+
+            return None, f"[GPT-Load响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[GPT-Load HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[GPT-Load错误] {e}"
+
+
+def _generate_image_yunwu(prompt: str, model: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 YUNWU Chat API 生成图片 (chat completions with image model)
+
+    Args:
+        prompt: 图片生成提示词
+        model: 图片生成模型
+        ref_image_b64: 参考图片的base64编码 (用于图生图)
+    """
+    import urllib.request
+    import urllib.error
+
+    url = YUNWU_IMAGE_CONFIG["url"]
+    headers = {
+        "Authorization": f"Bearer {YUNWU_IMAGE_CONFIG['key']}",
+        "Content-Type": "application/json"
+    }
+
+    # 构建消息内容
+    if ref_image_b64:
+        # 图生图模式：包含参考图片
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_image_b64}"}}
+        ]
+    else:
+        content = prompt
+
+    # 使用 chat completions 格式，模型会返回图片
+    data = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 4096
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # Chat completions 格式响应
+            if "choices" in result and len(result["choices"]) > 0:
+                msg_content = result["choices"][0].get("message", {}).get("content", "")
+                # 检查是否包含 base64 图片数据
+                if "data:image" in str(msg_content):
+                    # 提取 base64 部分
+                    import re
+                    content_str = str(msg_content) if not isinstance(msg_content, str) else msg_content
+                    match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', content_str)
+                    if match:
+                        return base64.b64decode(match.group(1)), ""
+
+            return None, f"[YUNWU响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[YUNWU HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[YUNWU错误] {e}"
+
+
+def _generate_image_google_api(prompt: str, model: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 google-api.aihang365.com (最终降级，Cookie模式无需Key)
+
+    Args:
+        prompt: 图片生成提示词
+        model: 图片生成模型
+        ref_image_b64: 参考图片的base64编码 (用于图生图)
+    """
+    import urllib.request
+    import urllib.error
+
+    url = GOOGLE_API_IMAGE_CONFIG["url"]
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    # 构建消息内容
+    if ref_image_b64:
+        # 图生图模式：包含参考图片
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_image_b64}"}}
+        ]
+    else:
+        content = prompt
+
+    # 使用 chat completions 格式
+    data = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 4096
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # Chat completions 格式响应
+            if "choices" in result and len(result["choices"]) > 0:
+                msg_content = result["choices"][0].get("message", {}).get("content", "")
+                # 检查是否包含 base64 图片数据
+                if "data:image" in str(msg_content):
+                    import re
+                    content_str = str(msg_content) if not isinstance(msg_content, str) else msg_content
+                    match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', content_str)
+                    if match:
+                        return base64.b64decode(match.group(1)), ""
+
+            return None, f"[Google-API响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[Google-API HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[Google-API错误] {e}"
+
+
+def generate_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, ref_image_b64: str = None) -> tuple[bytes, str, str] | tuple[None, str, str]:
+    """生成图片 (多API降级：GPT-Load -> YUNWU -> ZYAI -> NexusAI -> Google-API)
+
+    Args:
+        prompt: 图片生成提示词
+        model: 图片生成模型
+        ref_image_b64: 参考图片的base64编码 (用于图生图)
+
+    返回: (图片数据, 生成源, 错误信息)
+    """
+    errors = []
+
+    # 如果有参考图片，使用支持图生图的API降级链
+    if ref_image_b64:
+        # 1. 优先使用 YUNWU (有余额，chat completions支持图生图)
+        image_data, error = _generate_image_yunwu(prompt, model, ref_image_b64)
+        if image_data:
+            return image_data, "YUNWU", ""
+        errors.append(f"YUNWU: {error}")
+
+        # 2. 降级到 Google-API (chat completions支持图生图)
+        image_data, error = _generate_image_google_api(prompt, model, ref_image_b64)
+        if image_data:
+            return image_data, "Google-API", ""
+        errors.append(f"Google-API: {error}")
+
+        # 3. 最终降级：Google 专用图片编辑端点 (/v1/images/edit)
+        image_data, error = _generate_image_google_dedicated(prompt, ref_image_b64)
+        if image_data:
+            return image_data, "Google-Edit", ""
+        errors.append(f"Google-Edit: {error}")
+
+        return None, "", f"图生图失败: {' | '.join(errors)}"
+
+    # 1. 先尝试 GPT-Load (Cookie模式，无额度限制)
+    image_data, error = _generate_image_gptload(prompt, model)
+    if image_data:
+        return image_data, "GPT-Load", ""
+    errors.append(error)
+
+    # 2. 尝试 YUNWU
+    image_data, error = _generate_image_yunwu(prompt, model)
+    if image_data:
+        return image_data, "YUNWU", ""
+    errors.append(error)
+
+    # 3. 尝试 ZYAI
+    image_data, error = _generate_image_zyai(prompt, model)
+    if image_data:
+        return image_data, "ZYAI", ""
+    errors.append(error)
+
+    # 4. 尝试 NexusAI
+    image_data, error = _generate_image_nexusai(prompt, model)
+    if image_data:
+        return image_data, "NexusAI", ""
+    errors.append(error)
+
+    # 5. 最终降级：Google 专用图片生成端点 (/v1/generate-images)
+    image_data, error = _generate_image_google_dedicated(prompt)
+    if image_data:
+        return image_data, "Google-Gen", ""
+    errors.append(f"Google-Gen: {error}")
+
+    # 都失败了
+    return None, "", f"所有API都失败: {' | '.join(errors)}"
+
+
+# ==================== SQLite 存储模块 ====================
+
+def _get_db_path() -> Path:
+    """获取数据库路径"""
+    db_dir = Path.home() / ".gchat"
+    db_dir.mkdir(exist_ok=True)
+    return db_dir / "gchat.db"
+
+
+def _init_db():
+    """初始化SQLite数据库和表结构"""
+    db_path = _get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # 图片生成历史表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS image_generations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            url TEXT,
+            model TEXT,
+            source TEXT,
+            ref_image TEXT,
+            gen_time REAL,
+            upload_time REAL
+        )
+    ''')
+
+    # 图片描述历史表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS image_descriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            image_path TEXT NOT NULL,
+            json_result TEXT,
+            model TEXT,
+            source TEXT
+        )
+    ''')
+
+    # 创建索引加速查询
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_gen_timestamp ON image_generations(timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_desc_timestamp ON image_descriptions(timestamp)')
+
+    conn.commit()
+    conn.close()
+
+
+def _save_image_history(prompt: str, url: str, model: str, source: str, ref_image: str = None,
+                        gen_time: float = None, upload_time: float = None):
+    """保存图片生成历史到SQLite"""
+    from datetime import datetime
+
+    _init_db()
+    conn = sqlite3.connect(_get_db_path())
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT INTO image_generations (timestamp, prompt, url, model, source, ref_image, gen_time, upload_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (datetime.now().isoformat(), prompt, url, model, source, ref_image, gen_time, upload_time))
+
+    conn.commit()
+    conn.close()
+
+
+def _save_image_description(image_path: str, json_result: str, model: str, source: str):
+    """保存图片描述到SQLite"""
+    from datetime import datetime
+
+    _init_db()
+    conn = sqlite3.connect(_get_db_path())
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT INTO image_descriptions (timestamp, image_path, json_result, model, source)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (datetime.now().isoformat(), image_path, json_result, model, source))
+
+    conn.commit()
+    conn.close()
+
+
+def query_image_history(limit: int = 20, search: str = None, desc_only: bool = False) -> str:
+    """查询图片历史记录
+
+    Args:
+        limit: 返回记录数量
+        search: 搜索关键词 (匹配prompt或image_path)
+        desc_only: 仅显示描述历史
+
+    Returns:
+        格式化的历史记录字符串
+    """
+    _init_db()
+    conn = sqlite3.connect(_get_db_path())
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    results = []
+
+    if not desc_only:
+        # 查询图片生成历史
+        if search:
+            cursor.execute('''
+                SELECT * FROM image_generations
+                WHERE prompt LIKE ?
+                ORDER BY timestamp DESC LIMIT ?
+            ''', (f'%{search}%', limit))
+        else:
+            cursor.execute('''
+                SELECT * FROM image_generations
+                ORDER BY timestamp DESC LIMIT ?
+            ''', (limit,))
+
+        gen_rows = cursor.fetchall()
+        for row in gen_rows:
+            time_str = row['timestamp'][:19].replace('T', ' ')
+            gen_info = f" ({row['gen_time']:.1f}s)" if row['gen_time'] else ""
+            ref_info = f" [垫图]" if row['ref_image'] else ""
+            results.append(f"[生成] {time_str} | {row['source']}{gen_info}{ref_info}")
+            results.append(f"       {row['prompt'][:60]}{'...' if len(row['prompt']) > 60 else ''}")
+            results.append(f"       {row['url']}")
+            results.append("")
+
+    # 查询图片描述历史
+    if search:
+        cursor.execute('''
+            SELECT * FROM image_descriptions
+            WHERE image_path LIKE ? OR json_result LIKE ?
+            ORDER BY timestamp DESC LIMIT ?
+        ''', (f'%{search}%', f'%{search}%', limit))
+    else:
+        cursor.execute('''
+            SELECT * FROM image_descriptions
+            ORDER BY timestamp DESC LIMIT ?
+        ''', (limit,))
+
+    desc_rows = cursor.fetchall()
+    for row in desc_rows:
+        time_str = row['timestamp'][:19].replace('T', ' ')
+        results.append(f"[描述] {time_str} | {row['source']} | {row['model']}")
+        results.append(f"       {row['image_path']}")
+        # 显示JSON摘要
+        try:
+            json_obj = json.loads(row['json_result'])
+            if 'subjects' in json_obj:
+                subjects = json_obj.get('subjects', [])
+                if subjects and isinstance(subjects, list):
+                    first_subject = subjects[0] if subjects else {}
+                    appearance = first_subject.get('appearance', '')[:40] if isinstance(first_subject, dict) else ''
+                    results.append(f"       主体: {appearance}...")
+        except:
+            results.append(f"       {row['json_result'][:60]}...")
+        results.append("")
+
+    conn.close()
+
+    if not results:
+        return "暂无历史记录"
+
+    return "\n".join(results)
+
+
+def generate_and_upload_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, verbose: bool = True, ref_image: str = None) -> str:
+    """生成图片并上传到 R2，返回公开URL或错误信息
+
+    Args:
+        prompt: 图片生成提示词
+        model: 图片生成模型
+        verbose: 是否显示详细信息
+        ref_image: 参考图片路径 (垫图，用于图生图)
+    """
+    from datetime import datetime
+    import hashlib
+
+    start_time = time.time()
+
+    # 如果有参考图片，读取并编码
+    ref_image_data = None
+    if ref_image:
+        ref_path = Path(ref_image).expanduser()
+        if ref_path.exists():
+            with open(ref_path, "rb") as f:
+                ref_image_data = base64.b64encode(f.read()).decode()
+        else:
+            return f"[错误] 参考图片不存在: {ref_image}"
+
+    # 生成图片
+    image_data, source, error = generate_image(prompt, model, ref_image_data)
+    if error:
+        return error
+    if not image_data:
+        return "[错误] 图片生成失败，无数据返回"
+
+    gen_time = time.time() - start_time
+
+    # 生成语义化文件名: gchat_YYYYMMDD_HHMMSS_<hash>.png
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:6]
+    filename = f"gchat_{timestamp}_{prompt_hash}.png"
+
+    # 上传到 R2
+    upload_start = time.time()
+    url = upload_to_r2(image_data, filename)
+    upload_time = time.time() - upload_start
+    total_time = time.time() - start_time
+
+    # 保存历史记录
+    if url.startswith("http"):
+        _save_image_history(prompt, url, model, source, ref_image, gen_time, upload_time)
+
+    # 返回结果（包含元信息）
+    if url.startswith("http"):
+        if verbose:
+            ref_info = f" [垫图: {ref_image}]" if ref_image else ""
+            return f"{url}\n[{source}] {gen_time:.1f}s生成 + {upload_time:.1f}s上传 = {total_time:.1f}s{ref_info}"
+        return url
+    return url  # 错误信息
+
+
+# JSON描述提示词模板
+JSON_DESCRIBE_PROMPT = """请使用JSON格式详细描述这张照片，包括：
+- 图片尺寸 (width, height)
+- 主体对象 (subjects)
+  - 位置 (position)
+  - 外观 (appearance)
+  - 服装 (clothing)
+  - 表情 (expression)
+- 背景环境 (background)
+- 光线条件 (lighting)
+- 色彩风格 (color_style)
+- 构图方式 (composition)
+
+输出严格有效的JSON格式。"""
+
+
+def _describe_image_api(image_b64: str, model: str, api_url: str, api_key: str = None) -> tuple[str, str]:
+    """内部函数：调用API获取图片描述
+
+    Returns:
+        (json_content, error_message) - 成功返回(json, ""), 失败返回("", error)
+    """
+    import urllib.request
+    import urllib.error
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    content = [
+        {"type": "text", "text": JSON_DESCRIBE_PROMPT},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+    ]
+
+    data = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 4096
+    }).encode('utf-8')
+
+    req = urllib.request.Request(api_url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            if "choices" in result and len(result["choices"]) > 0:
+                msg_content = result["choices"][0].get("message", {}).get("content", "")
+                if isinstance(msg_content, str):
+                    import re
+                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', msg_content)
+                    if json_match:
+                        return json_match.group(1).strip(), ""
+                    json_match = re.search(r'\{[\s\S]*\}', msg_content)
+                    if json_match:
+                        return json_match.group(0), ""
+                    return msg_content, ""
+                return str(msg_content), ""
+
+            return "", f"响应异常: {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return "", f"HTTP {e.code}: {error_body[:100]}"
+    except Exception as e:
+        return "", str(e)
+
+
+def describe_image_json(image_path: str, model: str = "gemini-3-flash-preview") -> str:
+    """获取图片的JSON描述 (用于精准修图)
+
+    降级链: YUNWU -> Google-API
+
+    Args:
+        image_path: 图片路径
+        model: 使用的模型
+
+    Returns:
+        JSON格式的图片描述，或错误信息
+    """
+    # 读取图片并编码
+    img_path = Path(image_path).expanduser()
+    if not img_path.exists():
+        return f"[错误] 图片不存在: {image_path}"
+
+    with open(img_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode()
+
+    errors = []
+
+    # 1. 优先使用 YUNWU (有余额)
+    result, error = _describe_image_api(
+        image_b64, model,
+        YUNWU_IMAGE_CONFIG["url"],
+        YUNWU_IMAGE_CONFIG["key"]
+    )
+    if result:
+        # 保存到SQLite
+        _save_image_description(str(img_path), result, model, "YUNWU")
+        return result
+    errors.append(f"YUNWU: {error}")
+
+    # 2. 降级到 Google-API
+    result, error = _describe_image_api(
+        image_b64, model,
+        GOOGLE_API_IMAGE_CONFIG["url"]
+    )
+    if result:
+        # 保存到SQLite
+        _save_image_description(str(img_path), result, model, "Google-API")
+        return result
+    errors.append(f"Google-API: {error}")
+
+    return f"[错误] 所有API都失败: {' | '.join(errors)}"
+
+
+def _generate_image_google_dedicated(prompt: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 google-api 专用图片端点生成图片
+
+    - 文生图: /v1/generate-images
+    - 图生图: /v1/images/edit
+    """
+    import urllib.request
+    import urllib.error
+
+    if ref_image_b64:
+        # 图生图：使用 /v1/images/edit
+        url = "https://google-api.aihang365.com/v1/images/edit"
+        payload = {
+            "prompt": prompt,
+            "image": f"data:image/png;base64,{ref_image_b64}",
+            "response_type": "base64"
+        }
+    else:
+        # 文生图：使用 /v1/generate-images
+        url = "https://google-api.aihang365.com/v1/generate-images"
+        payload = {
+            "prompt": prompt,
+            "response_type": "base64"
+        }
+
+    headers = {"Content-Type": "application/json"}
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            if "images" in result and len(result["images"]) > 0:
+                img_data = result["images"][0]
+                # 移除 data:image 前缀
+                if img_data.startswith("data:image"):
+                    img_data = img_data.split(",", 1)[1]
+                return base64.b64decode(img_data), ""
+
+            return None, f"响应异常: {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"HTTP {e.code}: {error_body[:200]}"
+    except Exception as e:
+        return None, str(e)
+
+
+def edit_image_with_json(image_path: str, json_desc: str, model: str = DEFAULT_IMAGE_MODEL, verbose: bool = True) -> str:
+    """根据JSON描述生成新图片 (JSON精准修图)
+
+    Args:
+        image_path: 原图路径 (可选，用于参考)
+        json_desc: 修改后的JSON描述
+        model: 图片生成模型
+        verbose: 是否显示详细信息
+
+    Returns:
+        生成图片的URL或错误信息
+    """
+    # 构建生成提示词
+    prompt = f"请根据以下JSON描述生成一张新图片：\n\n{json_desc}"
+
+    # 如果提供了原图，作为参考
+    ref_image = image_path if image_path and Path(image_path).expanduser().exists() else None
+
+    return generate_and_upload_image(prompt, model, verbose, ref_image)
+
+
 def single_prompt(prompt, model, backend_name, output_json=False, use_stream=False):
     """单次提问模式"""
     backend_config = BACKENDS[backend_name]
@@ -2260,6 +3045,15 @@ def main():
   gchat -p "问题" --json   JSON 格式输出 (脚本集成)
   gchat --backend openai   使用 OpenAI 后端
 
+图片功能:
+  gchat -d a cute cat              生成图片 (免引号)
+  gchat -d "修改提示" -r img.png   图生图 (垫图)
+  gchat -D photo.jpg               获取图片JSON描述 (精准修图)
+  gchat -E desc.json               根据JSON生成新图
+  gchat -E desc.json -r orig.jpg   JSON修图 (参考原图)
+  gchat -H                         查看图片历史
+  gchat -H cat                     搜索历史 (关键词: cat)
+
 交互命令:
   /read <file>   读取文件让 AI 分析
   /write <file>  保存 AI 回复到文件
@@ -2286,11 +3080,64 @@ def main():
                         help='安静模式（不显示交互式UI，仅输出结果）')
     parser.add_argument('--list-models', action='store_true',
                         help='列出可用模型和后端')
+    parser.add_argument('--draw', '-d', nargs='*', metavar='WORD',
+                        help='生成图片，支持免引号 (如: gchat -d a cute cat)')
+    parser.add_argument('--image-model', type=str, default=DEFAULT_IMAGE_MODEL,
+                        help='图片生成模型 (image, image-2k, image-4k, image-flash)')
+    parser.add_argument('--ref', '-r', type=str, metavar='IMAGE_PATH',
+                        help='参考图片路径 (垫图，用于图生图)')
+    parser.add_argument('--describe', '-D', type=str, metavar='IMAGE_PATH',
+                        help='获取图片的JSON描述 (用于精准修图)')
+    parser.add_argument('--edit-json', '-E', type=str, metavar='JSON_FILE',
+                        help='根据JSON描述生成新图片 (JSON精准修图)')
+    parser.add_argument('--image-history', '-H', nargs='?', const='', metavar='SEARCH',
+                        help='查看图片历史 (可选搜索关键词)')
+    parser.add_argument('--history-limit', type=int, default=20,
+                        help='历史记录返回数量 (默认20)')
 
     args = parser.parse_args()
 
     if args.list_models:
         list_models()
+        return
+
+    # 图片历史查询模式
+    if args.image_history is not None:
+        search = args.image_history if args.image_history else None
+        result = query_image_history(limit=args.history_limit, search=search)
+        print(result)
+        return
+
+    # JSON描述模式
+    if args.describe:
+        print(f"正在获取图片JSON描述: {args.describe}")
+        result = describe_image_json(args.describe)
+        print(result)
+        return
+
+    # JSON精准修图模式
+    if args.edit_json:
+        json_path = Path(args.edit_json).expanduser()
+        if not json_path.exists():
+            print(f"[错误] JSON文件不存在: {args.edit_json}")
+            return
+        with open(json_path, 'r', encoding='utf-8') as f:
+            json_desc = f.read()
+        print(f"正在根据JSON生成图片...")
+        image_model = IMAGE_MODELS.get(args.image_model, args.image_model)
+        result = edit_image_with_json(args.ref, json_desc, image_model)
+        print(result)
+        return
+
+    if args.draw is not None:
+        # 图片生成模式 (支持免引号: gchat -d a cute cat)
+        prompt = ' '.join(args.draw) if args.draw else ""
+        if not prompt:
+            print("[错误] 请提供图片生成提示词")
+            return
+        image_model = IMAGE_MODELS.get(args.image_model, args.image_model)
+        result = generate_and_upload_image(prompt, image_model, ref_image=args.ref)
+        print(result)
         return
 
     if args.prompt:
