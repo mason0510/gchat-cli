@@ -115,6 +115,32 @@ FALLBACK_MODELS = {
     "gemini-3-flash-preview": "gemini-2.5-flash",
 }
 
+# 图片生成模型
+IMAGE_MODELS = {
+    "image": "gemini-3-pro-image-preview",  # 默认
+    "image-2k": "gemini-3-pro-image-preview-2k",
+    "image-4k": "gemini-3-pro-image-preview-4k",
+    "image-flash": "gemini-2.5-flash-image",
+}
+
+# 图片生成默认模型
+DEFAULT_IMAGE_MODEL = "gemini-3-pro-image-preview"
+
+# R2 存储配置
+R2_CONFIG = {
+    "access_key_id": "35f9ace41767c9ba5d4c60d804d0063a",
+    "secret_access_key": "cfff46ae5a409785f5dd87e5fe47d95a3d5682c661887b91c375b4a23edda8cb",
+    "bucket": "gemini",
+    "endpoint": "https://79e5a95d36e6e4084ae15fcc4220b127.r2.cloudflarestorage.com",
+    "public_url": "https://pub-87cd59069cf0444aad048f7bddec99af.r2.dev",
+}
+
+# NexusAI 图片生成配置
+NEXUSAI_IMAGE_CONFIG = {
+    "url": "https://nexusai.aihang365.com/v1/images/generations",
+    "key": "sk-BwOEIrmXoy6AL4IwEeBL9FuoPIRIf25I8bhObhGazgBSr2nC",
+}
+
 # 预定义的常用工具
 BUILTIN_TOOLS = {
     "weather": {
