@@ -1,7 +1,7 @@
 # gchat CLI 使用指南
 
-**日期**: 2025-12-19
-**版本**: v2.0.0
+**日期**: 2026-01-17
+**版本**: v3.0.0
 
 ---
 
@@ -275,43 +275,39 @@ done
 
 ## 配置文件
 
-### 后端配置位置
+### 环境变量配置
 
-`/Users/houzi/bin/gchat` 第30-40行：
-
-```python
-BACKENDS = {
-    "local": {
-        "url": "http://82.29.54.80:8100/v1/chat/completions",
-        "name": "Gemini Reverse API (本地)",
-    },
-    "nexus": {
-        "url": "https://nexusai.aihang365.com/v1/chat/completions",
-        "key": "YOUR_API_KEY_HERE",  # 需要替换为实际key
-        "name": "NexusAI",
-    },
-}
-```
-
-### 自定义后端
-
-要添加新后端，编辑 `/Users/houzi/bin/gchat`：
-
-```python
-BACKENDS = {
-    # ... 现有后端 ...
-    "custom": {
-        "url": "https://your-api.com/v1/chat/completions",
-        "key": "your-api-key",
-        "name": "自定义后端",
-    },
-}
-```
-
-然后使用：
+gchat 通过 `.env` 文件配置。复制项目中的 `.env.example` 到以下位置之一：
 
 ```bash
-gchat -p "test" -b custom
+# 推荐：用户配置目录
+mkdir -p ~/.gchat
+cp .env.example ~/.gchat/.env
+
+# 或者：当前目录
+cp .env.example .env
+```
+
+### 配置示例
+
+```bash
+# 主后端
+GOOGLE_API_URL=https://your-api-proxy.com/v1/chat/completions
+
+# NexusAI 后端
+NEXUSAI_URL=https://your-nexusai.com/v1/chat/completions
+NEXUSAI_KEY=your_api_key
+
+# 本地后端（可选）
+LOCAL_API_URL=http://localhost:8100/v1/chat/completions
+```
+
+### 使用指定后端
+
+```bash
+gchat -p "test" -b nexus
+gchat -p "test" -b local
+gchat -p "test" -b google-api
 ```
 
 ---
@@ -323,9 +319,9 @@ gchat -p "test" -b custom
 **现象**: `[API错误]: bad_response_status_code`
 
 **解决**:
-1. 检查 `/Users/houzi/bin/gchat` 中的BACKENDS配置
+1. 检查 `~/.gchat/.env` 中的API配置
 2. 确认API key是否有效
-3. 测试API连接：`bash /tmp/test-nexusai.sh`
+3. 尝试切换后端：`gchat -p "test" -b local`
 
 ### 问题：命令not found
 
@@ -334,10 +330,10 @@ gchat -p "test" -b custom
 **解决**:
 ```bash
 # 检查gchat是否存在
-ls -la /Users/houzi/bin/gchat
+ls -la ~/bin/gchat
 
 # 检查PATH
-echo $PATH | grep "/Users/houzi/bin"
+echo $PATH | grep "$HOME/bin"
 
 # 添加到PATH（如果需要）
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
@@ -348,11 +344,11 @@ source ~/.zshrc
 
 ## 参考文档
 
-- NexusAI API文档: `docs/zhongzhuan_API.md`
-- gchat修复记录: `docs/GCHAT-FIX.md`
-- 脚本位置: `/Users/houzi/bin/gchat`
+- 配置模板: `.env.example`
+- 主文档: `README.md`
 
 ---
 
-**维护者**: Claude Code
-**最后更新**: 2025-12-19
+**维护者**: Claude Code & Mason
+**最后更新**: 2026-01-17
+**版本**: v3.0.0

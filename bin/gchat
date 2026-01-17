@@ -65,30 +65,57 @@ except Exception:
     FileHistory = None
     KeyBindings = None
 
-# 后端配置
+
+# ==================== 配置加载 ====================
+
+def _load_env_file():
+    """加载 .env 配置文件 (支持多个位置)"""
+    env_paths = [
+        Path.home() / ".gchat" / ".env",  # 用户配置目录
+        Path(__file__).parent.parent / ".env",  # 项目目录
+        Path.cwd() / ".env",  # 当前目录
+    ]
+
+    for env_path in env_paths:
+        if env_path.exists():
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, _, value = line.partition('=')
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key and value and key not in os.environ:
+                            os.environ[key] = value
+            break  # 只加载第一个找到的 .env
+
+_load_env_file()
+
+
+# ==================== 后端配置 ====================
 BACKENDS = {
     "google": {
-        "url": "https://google-api.aihang365.com/v1/chat/completions",
-        "name": "Google API (内部服务，支持Function Calling)",
+        "url": os.environ.get("GOOGLE_API_URL", ""),
+        "name": "Google API (支持Function Calling)",
         "supports_tools": True,
     },
     "local": {
-        "url": "http://82.29.54.80:8100/v1/chat/completions",
+        "url": os.environ.get("LOCAL_API_URL", "http://localhost:8100/v1/chat/completions"),
         "name": "Gemini Reverse API (本地)",
         "supports_tools": False,
     },
     "nexus": {
-        "url": "https://nexusai.aihang365.com/v1/chat/completions",
-        "key": "GeminiReverseTest2025abcdefghijklmnopqrstuvwx",
+        "url": os.environ.get("NEXUSAI_URL", ""),
+        "key": os.environ.get("NEXUSAI_KEY", ""),
         "name": "NexusAI",
         "supports_tools": False,
     },
     "official": {
-        "url": "https://gemini-official.aihang365.com/v1beta/models/{model}:generateContent",
+        "url": os.environ.get("GEMINI_OFFICIAL_URL", "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"),
         "key": os.environ.get("GEMINI_API_KEY", ""),
-        "name": "Google Official API (via US Proxy)",
+        "name": "Google Official API",
         "supports_tools": True,
-        "default_model": "gemini-2.5-flash-lite",  # 有免费额度且支持tools
+        "default_model": "gemini-2.5-flash-lite",
     },
 }
 
@@ -127,42 +154,42 @@ IMAGE_MODELS = {
 # 图片生成默认模型
 DEFAULT_IMAGE_MODEL = "gemini-3-pro-image-preview"
 
-# R2 存储配置
+# R2 存储配置 (用于上传生成的图片)
 R2_CONFIG = {
-    "access_key_id": "35f9ace41767c9ba5d4c60d804d0063a",
-    "secret_access_key": "cfff46ae5a409785f5dd87e5fe47d95a3d5682c661887b91c375b4a23edda8cb",
-    "bucket": "gemini",
-    "endpoint": "https://79e5a95d36e6e4084ae15fcc4220b127.r2.cloudflarestorage.com",
-    "public_url": "https://pub-87cd59069cf0444aad048f7bddec99af.r2.dev",
+    "access_key_id": os.environ.get("R2_ACCESS_KEY_ID", ""),
+    "secret_access_key": os.environ.get("R2_SECRET_ACCESS_KEY", ""),
+    "bucket": os.environ.get("R2_BUCKET", "gchat"),
+    "endpoint": os.environ.get("R2_ENDPOINT", ""),
+    "public_url": os.environ.get("R2_PUBLIC_URL", ""),
 }
 
 # NexusAI 图片生成配置
 NEXUSAI_IMAGE_CONFIG = {
-    "url": "https://nexusai.aihang365.com/v1/images/generations",
-    "key": "sk-BwOEIrmXoy6AL4IwEeBL9FuoPIRIf25I8bhObhGazgBSr2nC",
+    "url": os.environ.get("NEXUSAI_IMAGE_URL", ""),
+    "key": os.environ.get("NEXUSAI_IMAGE_KEY", ""),
 }
 
-# GPT-Load 图片生成配置 (首选，Cookie模式无额度限制)
+# GPT-Load 图片生成配置 (Cookie模式)
 GPTLOAD_IMAGE_CONFIG = {
-    "url": "https://gpt-load.aihang365.com/proxy/gemini-cookie/v1/images/generations",
-    "key": "Zhxc6545398@",
+    "url": os.environ.get("GPTLOAD_IMAGE_URL", ""),
+    "key": os.environ.get("GPTLOAD_IMAGE_KEY", ""),
 }
 
-# ZYAI 图片生成配置 (备用)
+# ZYAI 图片生成配置
 ZYAI_IMAGE_CONFIG = {
-    "url": "https://api.zyai.online/v1beta/models/{model}:generateContent",
-    "key": "sk-pNYQej3gfPbTdpPADbBb837dBcB0454dAe262c13E5E4D65d",
+    "url": os.environ.get("ZYAI_IMAGE_URL", ""),
+    "key": os.environ.get("ZYAI_IMAGE_KEY", ""),
 }
 
-# YUNWU Chat 图片生成配置 (备用，使用chat completions接口)
+# YUNWU Chat 图片生成配置
 YUNWU_IMAGE_CONFIG = {
-    "url": "https://yunwu.zeabur.app/v1/chat/completions",
-    "key": "sk-Y5h8IJXuW9ONMQ4L6s66cWcNfBIMyEI9RhEpEtUnd7UYjUh8",
+    "url": os.environ.get("YUNWU_IMAGE_URL", ""),
+    "key": os.environ.get("YUNWU_IMAGE_KEY", ""),
 }
 
-# Google-API 图片生成配置 (最终降级，Cookie模式)
+# Google-API 图片生成配置 (Cookie模式，无需Key)
 GOOGLE_API_IMAGE_CONFIG = {
-    "url": "https://google-api.aihang365.com/v1/chat/completions",
+    "url": os.environ.get("GOOGLE_API_IMAGE_URL", os.environ.get("GOOGLE_API_URL", "")),
 }
 
 # 预定义的常用工具
@@ -887,7 +914,7 @@ def print_header():
     print(colored(VL + H * total_inner + VR, Color.DIM))
 
     # 底部信息行
-    info_text = " v5.0  ·  nexusai.aihang365.com  ·  /help for commands "
+    info_text = " v5.0  ·  gchat-cli  ·  /help for commands "
     info_line = pad_right(colored(info_text, Color.CYAN), total_inner)
     print(colored(V, Color.DIM) + info_line + colored(V, Color.DIM))
 
@@ -1156,7 +1183,7 @@ def chat_request(messages, model, backend_config, retry=2, debug=False, show_spi
                     f"建议:\n"
                     f"- 重试几次（可能是瞬时网络波动）\n"
                     f"- 切换网络（WiFi → 有线 或 手机热点）\n"
-                    f"- 尝试: curl -v https://nexusai.aihang365.com\n"
+                    f"- 检查API配置是否正确\n"
                     f"- 或使用本地后端: gchat -b local"
                 )
 
@@ -2440,7 +2467,7 @@ def _generate_image_yunwu(prompt: str, model: str, ref_image_b64: str = None) ->
 
 
 def _generate_image_google_api(prompt: str, model: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
-    """使用 google-api.aihang365.com (最终降级，Cookie模式无需Key)
+    """使用 Google API (最终降级，Cookie模式无需Key)
 
     Args:
         prompt: 图片生成提示词
@@ -2914,9 +2941,14 @@ def _generate_image_google_dedicated(prompt: str, ref_image_b64: str = None) -> 
     import urllib.request
     import urllib.error
 
+    # 从 GOOGLE_API_URL 提取 base URL
+    base_url = os.environ.get("GOOGLE_API_URL", "").rsplit("/v1/", 1)[0]
+    if not base_url:
+        return None, "未配置 GOOGLE_API_URL"
+
     if ref_image_b64:
         # 图生图：使用 /v1/images/edit
-        url = "https://google-api.aihang365.com/v1/images/edit"
+        url = f"{base_url}/v1/images/edit"
         payload = {
             "prompt": prompt,
             "image": f"data:image/png;base64,{ref_image_b64}",
@@ -2924,7 +2956,7 @@ def _generate_image_google_dedicated(prompt: str, ref_image_b64: str = None) -> 
         }
     else:
         # 文生图：使用 /v1/generate-images
-        url = "https://google-api.aihang365.com/v1/generate-images"
+        url = f"{base_url}/v1/generate-images"
         payload = {
             "prompt": prompt,
             "response_type": "base64"
