@@ -1,0 +1,9 @@
+#!/bin/bash
+# claudeminimax - MiniMax API wrapper for Claude-compatible interface
+
+export ANTHROPIC_BASE_URL="https://api.minimaxi.com/anthropic"
+export ANTHROPIC_AUTH_TOKEN="sk-cp-QnQIXimRR5MkTKeq0zQ1gdzJYpeaO1iK5bG69mbP2PN3xnrMR-jIuHtxJHkXV_56l0pVF8mYY5XXUfq6ZoMpqw3ESrGdzzkCXCs6WhFdeUzbNVNHa2O933k"
+export ANTHROPIC_MODEL="MiniMax-M2.1"
+
+# 使用 claude 命令调用 MiniMax API
+claude "$@"

@@ -1,0 +1,4 @@
+#!/bin/bash
+# claudeminimaxd - MiniMax API wrapper for Claude Desktop
+
+claudeminimax --dangerously-skip-permissions "$@"

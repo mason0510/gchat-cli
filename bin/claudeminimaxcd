@@ -1,0 +1,4 @@
+#!/bin/bash
+# claudeminimaxcd - 使用 MiniMax API 启动 Claude Code
+
+claudeminimax --dangerously-skip-permissions -c "$@"
