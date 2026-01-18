@@ -1,4 +1,4 @@
-# gchat - Verbs for AI
+# turing - Verbs for AI
 
 **版本**: v3.0.0 | **日期**: 2026-01-17 | **作者**: Claude Code & Mason
 
@@ -19,11 +19,11 @@ Verbs  = 动词 = 主动行动 = "我要做什么"
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 为什么用 gchat？
+## 为什么用 turing？
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Claude Code + GLM4.7 + gchat = 99% Claude Code 官方模型功能    │
+│  Claude Code + GLM4.7 + turing = 99% Claude Code 官方模型功能   │
 │                                                                 │
 │  ✅ 成本节省 90%        ✅ 额外功能（图片生成、多模型切换）     │
 │  ✅ CLI 形式易于 AI 调用  ✅ 无限对话（逆向 API）               │
@@ -45,32 +45,36 @@ Verbs  = 动词 = 主动行动 = "我要做什么"
 ```bash
 # 克隆并安装
 git clone https://github.com/your-repo/gchat-cli.git
-cp gchat-cli/bin/gchat ~/bin/
-chmod +x ~/bin/gchat
+cp gchat-cli/bin/turing ~/bin/
+cp gchat-cli/bin/gchat ~/bin/  # 可选：兼容旧命令
+chmod +x ~/bin/turing ~/bin/turing
 
 # 配置 API（复制模板并填写）
-mkdir -p ~/.gchat
+mkdir -p ~/.turing
 cp gchat-cli/.env.example ~/.gchat/.env
 # 编辑 ~/.gchat/.env 填入你的 API 配置
 
 # 测试
-gchat --help
+turing --help
+# 或者用 gchat --help（兼容）
 ```
 
 ### 基本使用
 
 ```bash
 # 交互式对话
-gchat
+turing
 
 # 单次提问（适合脚本/AI调用）
-gchat -p "什么是量子计算？"
+turing -p "什么是量子计算？"
 
 # 继续上次对话
-gchat -c
+turing -c
 
 # 指定模型
-gchat -p "复杂问题" -m pro
+turing -p "复杂问题" -m pro
+
+# 注：gchat 命令完全兼容，可以互换使用
 ```
 
 ---
@@ -81,7 +85,7 @@ gchat -p "复杂问题" -m pro
 
 ```bash
 # 交互式对话
-$ gchat
+$ turing
 You> 你好
 AI> 你好！有什么可以帮你？
 
@@ -102,65 +106,65 @@ You> /quit          # 退出并保存
 
 ```bash
 # 基本提问
-gchat -p "1+1=?"
+turing -p "1+1=?"
 
 # JSON 输出（适合脚本解析）
-gchat -p "列出3种编程语言" --json
+turing -p "列出3种编程语言" --json
 
 # 安静模式（仅输出结果）
-gchat -p "计算 100*200" -q
+turing -p "计算 100*200" -q
 
 # 在 Claude Code 中调用
-result=$(gchat -p "总结这段代码的功能: $(cat main.py)")
+result=$(turing -p "总结这段代码的功能: $(cat main.py)")
 ```
 
 ### 3. AI 图片生成
 
 ```bash
 # 文生图（免引号语法）
-gchat -d a cute orange cat sleeping
+turing -d a cute orange cat sleeping
 
 # 带引号也可以
-gchat --draw "一只橘猫在阳光下打盹"
+turing --draw "一只橘猫在阳光下打盹"
 
 # 图生图（垫图）
-gchat -d "改成水彩风格" -r ~/photo.jpg
+turing -d "改成水彩风格" -r ~/photo.jpg
 
 # 选择图片模型
-gchat -d "高清风景" --image-model image-4k
+turing -d "高清风景" --image-model image-4k
 
 # 查看图片历史
-gchat -H
+turing -H
 
 # 搜索历史
-gchat -H cat
+turing -H cat
 ```
 
 ### 4. JSON 精准修图
 
 ```bash
 # 步骤1：AI 分析图片生成 JSON 描述
-gchat -D ~/image.png
+turing -D ~/image.png
 # 输出: {"background": "蓝天", "subject": "橘猫", "style": "写实", ...}
 
 # 步骤2：修改 JSON（手动或让 AI 改）
-gchat -p "把 style 改成 水彩画风"
+turing -p "把 style 改成 水彩画风"
 
 # 步骤3：用 JSON 重新生成
-gchat -E modified.json
+turing -E modified.json
 
 # 可选：参考原图生成
-gchat -E modified.json -r original.png
+turing -E modified.json -r original.png
 ```
 
 ### 5. 会话管理
 
 ```bash
 # 继续上次对话
-gchat -c
+turing -c
 
 # 查看所有会话
-gchat
+turing
 You> /sessions
 
 # 加载指定会话
@@ -178,21 +182,21 @@ You> /clear
 
 | 参数 | 短参数 | 说明 | 示例 |
 |------|--------|------|------|
-| `--prompt` | `-p` | 单次提问 | `gchat -p "问题"` |
-| `--continue` | `-c` | 继续上次会话 | `gchat -c` |
-| `--model` | `-m` | 指定模型 | `gchat -m pro` |
-| `--backend` | `-b` | 指定后端 | `gchat -b nexus` |
-| `--json` | | JSON 格式输出 | `gchat -p "问题" --json` |
-| `--quiet` | `-q` | 安静模式 | `gchat -p "问题" -q` |
-| `--no-stream` | | 禁用流式输出 | `gchat --no-stream` |
-| `--list-models` | | 列出可用模型 | `gchat --list-models` |
-| `--draw` | `-d` | 文生图 | `gchat -d a cute cat` |
-| `--ref` | `-r` | 图生图参考图 | `gchat -d "描述" -r img.jpg` |
-| `--image-model` | | 图片模型 | `gchat -d "描述" --image-model image-4k` |
-| `--describe` | `-D` | 获取图片 JSON 描述 | `gchat -D image.png` |
-| `--edit-json` | `-E` | 用 JSON 生成图片 | `gchat -E desc.json` |
-| `--image-history` | `-H` | 查看图片历史 | `gchat -H [关键词]` |
-| `--history-limit` | | 历史数量限制 | `gchat -H --history-limit 50` |
+| `--prompt` | `-p` | 单次提问 | `turing -p "问题"` |
+| `--continue` | `-c` | 继续上次会话 | `turing -c` |
+| `--model` | `-m` | 指定模型 | `turing -m pro` |
+| `--backend` | `-b` | 指定后端 | `turing -b nexus` |
+| `--json` | | JSON 格式输出 | `turing -p "问题" --json` |
+| `--quiet` | `-q` | 安静模式 | `turing -p "问题" -q` |
+| `--no-stream` | | 禁用流式输出 | `turing --no-stream` |
+| `--list-models` | | 列出可用模型 | `turing --list-models` |
+| `--draw` | `-d` | 文生图 | `turing -d a cute cat` |
+| `--ref` | `-r` | 图生图参考图 | `turing -d "描述" -r img.jpg` |
+| `--image-model` | | 图片模型 | `turing -d "描述" --image-model image-4k` |
+| `--describe` | `-D` | 获取图片 JSON 描述 | `turing -D image.png` |
+| `--edit-json` | `-E` | 用 JSON 生成图片 | `turing -E desc.json` |
+| `--image-history` | `-H` | 查看图片历史 | `turing -H [关键词]` |
+| `--history-limit` | | 历史数量限制 | `turing -H --history-limit 50` |
 
 ### 交互式命令
 
@@ -232,7 +236,7 @@ You> /clear
 
 ```bash
 # 创建配置目录
-mkdir -p ~/.gchat
+mkdir -p ~/.turing
 
 # 复制模板
 cp .env.example ~/.gchat/.env
@@ -260,7 +264,7 @@ NEXUSAI_KEY=your_api_key
 # 图片上传（可选，用于图片历史云存储）
 R2_ACCESS_KEY_ID=your_key
 R2_SECRET_ACCESS_KEY=your_secret
-R2_BUCKET=gchat
+R2_BUCKET=turing
 R2_ENDPOINT=https://xxx.r2.cloudflarestorage.com
 R2_PUBLIC_URL=https://pub-xxx.r2.dev
 ```
@@ -273,14 +277,14 @@ R2_PUBLIC_URL=https://pub-xxx.r2.dev
 
 ```bash
 # 在 Claude Code 中调用 gchat 获取 Gemini 的回答
-gchat -p "用 Gemini 分析这个架构设计的优缺点: ..."
+turing -p "用 Gemini 分析这个架构设计的优缺点: ..."
 
 # 让 gchat 生成图片
-gchat -d "系统架构图，包含前端、后端、数据库"
+turing -d "系统架构图，包含前端、后端、数据库"
 
 # 对比不同模型的回答
-gchat -p "问题" -m flash3  # Gemini
-gchat -p "问题" -b official  # 官方 API
+turing -p "问题" -m flash3  # Gemini
+turing -p "问题" -b official  # 官方 API
 ```
 
 ### 场景2：脚本集成
@@ -289,7 +293,7 @@ gchat -p "问题" -b official  # 官方 API
 #!/bin/bash
 # 自动生成 commit message
 diff=$(git diff --staged)
-message=$(gchat -p "为这些改动生成简洁的 commit message: $diff" -q)
+message=$(turing -p "为这些改动生成简洁的 commit message: $diff" -q)
 git commit -m "$message"
 ```
 
@@ -298,18 +302,18 @@ git commit -m "$message"
 ```bash
 # 批量生成产品图
 for style in "简约" "科技感" "温馨"; do
-  gchat -d "手机产品图，${style}风格" --image-model image-2k
+  turing -d "手机产品图，${style}风格" --image-model image-2k
 done
 
 # 查看生成历史
-gchat -H
+turing -H
 ```
 
 ---
 
 ## 与 Claude Code 的配合
 
-gchat 设计为 Claude Code 的轻量级多模型网关：
+turing 设计为 Claude Code 的轻量级多模型网关：
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -318,10 +322,10 @@ gchat 设计为 Claude Code 的轻量级多模型网关：
 │  │  用户: "帮我用 Gemini 分析这个问题"                  │ │
 │  │                                                      │ │
 │  │  Claude Code 调用:                                   │ │
-│  │  $ gchat -p "分析问题..." -q                        │ │
+│  │  $ turing -p "分析问题..." -q                        │ │
 │  │                                                      │ │
 │  │  Claude Code 调用:                                   │ │
-│  │  $ gchat -d "生成示意图"                            │ │
+│  │  $ turing -d "生成示意图"                            │ │
 │  └─────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -361,17 +365,17 @@ gchat-cli/
 cat ~/.gchat/.env
 
 # 测试连接
-gchat -p "test" -b local
+turing -p "test" -b local
 
 # 切换后端
-gchat -p "test" -b nexus
+turing -p "test" -b nexus
 ```
 
 ### 命令找不到
 
 ```bash
 # 检查安装
-ls -la ~/bin/gchat
+ls -la ~/bin/turing
 
 # 添加到 PATH
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc

@@ -1,0 +1,3183 @@
+#!/usr/bin/env python3
+"""
+Turing CLI - 多轮会话命令行工具
+支持多种后端：本地Gemini Reverse API、NexusAI等
+
+用法:
+    turing                    # 交互式多轮会话（默认 gemini-3-flash-preview）
+    gflashchat               # 使用 gemini-3-flash-preview
+    turing -m flash3          # 使用 flash3 模型
+    turing -p "你好"          # 单次提问
+    turing --backend nexus    # 使用NexusAI后端
+    turing --list-models      # 列出可用模型
+"""
+
+import argparse
+import json
+import os
+import sys
+import subprocess
+import readline  # 支持历史记录和行编辑
+import base64
+import mimetypes
+import re
+import shlex
+import shutil
+import signal
+import glob as glob_module
+import threading
+import time
+import sqlite3
+from pathlib import Path
+
+from wcwidth import wcswidth, wcwidth
+
+
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_terminal_paste(text: str) -> str:
+    """清理终端粘贴可能带来的控制字符/转义序列。
+
+    目的：避免把不可见控制字符带进 prompt / API 请求，或触发快捷键行为。
+    """
+    if not text:
+        return text
+
+    # 统一换行
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 常见的 bracketed paste 包裹
+    text = text.replace("\x1b[200~", "").replace("\x1b[201~", "")
+
+    # 移除不可见控制字符（保留换行/制表符）
+    return _CTRL_CHARS_RE.sub("", text)
+
+try:
+    from prompt_toolkit import prompt as pt_prompt
+    from prompt_toolkit.formatted_text import ANSI as PTANSI, HTML
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+except Exception:
+    pt_prompt = None
+    PTANSI = None
+    HTML = None
+    FileHistory = None
+    KeyBindings = None
+
+
+# ==================== 配置加载 ====================
+
+def _load_env_file():
+    """加载 .env 配置文件 (支持多个位置)"""
+    env_paths = [
+        Path.home() / ".turing" / ".env",  # 用户配置目录
+        Path(__file__).parent.parent / ".env",  # 项目目录
+        Path.cwd() / ".env",  # 当前目录
+    ]
+
+    for env_path in env_paths:
+        if env_path.exists():
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, _, value = line.partition('=')
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key and value and key not in os.environ:
+                            os.environ[key] = value
+            break  # 只加载第一个找到的 .env
+
+_load_env_file()
+
+
+# ==================== 后端配置 ====================
+BACKENDS = {
+    "google": {
+        "url": os.environ.get("GOOGLE_API_URL", ""),
+        "name": "Google API (支持Function Calling)",
+        "supports_tools": True,
+    },
+    "local": {
+        "url": os.environ.get("LOCAL_API_URL", "http://localhost:8100/v1/chat/completions"),
+        "name": "Gemini Reverse API (本地)",
+        "supports_tools": False,
+    },
+    "nexus": {
+        "url": os.environ.get("NEXUSAI_URL", ""),
+        "key": os.environ.get("NEXUSAI_KEY", ""),
+        "name": "NexusAI",
+        "supports_tools": False,
+    },
+    "official": {
+        "url": os.environ.get("GEMINI_OFFICIAL_URL", "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"),
+        "key": os.environ.get("GEMINI_API_KEY", ""),
+        "name": "Google Official API",
+        "supports_tools": True,
+        "default_model": "gemini-2.5-flash-lite",
+    },
+}
+
+# 官方API模型映射 (逆向模型名 -> 官方模型名)
+OFFICIAL_MODEL_MAP = {
+    "gemini-3-flash-preview": "gemini-2.5-flash-lite",
+    "gemini-2.5-flash": "gemini-2.5-flash-lite",
+    "gemini-2.5-pro": "gemini-2.5-flash-lite",  # pro没免费额度，降级到flash-lite
+    "gemini-3.0-pro": "gemini-2.5-flash-lite",
+}
+
+# 模型别名
+MODEL_ALIASES = {
+    "pro3": "gemini-3-pro-preview",
+    "flash3": "gemini-3-flash-preview",  # ⭐ turing 默认
+    "flash": "gemini-3-flash-preview",
+    "flash2": "gemini-2.5-flash",  # 旧版 Flash
+    "pro": "gemini-2.5-pro",
+    "3": "gemini-3.0-pro",
+}
+
+# 模型降级映射 (gemini-3 失败时降级到 gemini-2.5)
+FALLBACK_MODELS = {
+    "gemini-3-pro-preview": "gemini-2.5-pro",
+    "gemini-3-flash-preview": "gemini-2.5-flash",
+}
+
+# 图片生成模型
+IMAGE_MODELS = {
+    "image": "gemini-3-pro-image-preview",  # 默认
+    "image-2k": "gemini-3-pro-image-preview-2k",
+    "image-4k": "gemini-3-pro-image-preview-4k",
+    "image-flash": "gemini-2.5-flash-image",
+}
+
+# 图片生成默认模型
+DEFAULT_IMAGE_MODEL = "gemini-3-pro-image-preview"
+
+# R2 存储配置 (用于上传生成的图片)
+R2_CONFIG = {
+    "access_key_id": os.environ.get("R2_ACCESS_KEY_ID", ""),
+    "secret_access_key": os.environ.get("R2_SECRET_ACCESS_KEY", ""),
+    "bucket": os.environ.get("R2_BUCKET", "turing"),
+    "endpoint": os.environ.get("R2_ENDPOINT", ""),
+    "public_url": os.environ.get("R2_PUBLIC_URL", ""),
+}
+
+# NexusAI 图片生成配置
+NEXUSAI_IMAGE_CONFIG = {
+    "url": os.environ.get("NEXUSAI_IMAGE_URL", ""),
+    "key": os.environ.get("NEXUSAI_IMAGE_KEY", ""),
+}
+
+# GPT-Load 图片生成配置 (Cookie模式)
+GPTLOAD_IMAGE_CONFIG = {
+    "url": os.environ.get("GPTLOAD_IMAGE_URL", ""),
+    "key": os.environ.get("GPTLOAD_IMAGE_KEY", ""),
+}
+
+# ZYAI 图片生成配置
+ZYAI_IMAGE_CONFIG = {
+    "url": os.environ.get("ZYAI_IMAGE_URL", ""),
+    "key": os.environ.get("ZYAI_IMAGE_KEY", ""),
+}
+
+# YUNWU Chat 图片生成配置
+YUNWU_IMAGE_CONFIG = {
+    "url": os.environ.get("YUNWU_IMAGE_URL", ""),
+    "key": os.environ.get("YUNWU_IMAGE_KEY", ""),
+}
+
+# Google-API 图片生成配置 (Cookie模式，无需Key)
+GOOGLE_API_IMAGE_CONFIG = {
+    "url": os.environ.get("GOOGLE_API_IMAGE_URL", os.environ.get("GOOGLE_API_URL", "")),
+}
+
+# 预定义的常用工具
+BUILTIN_TOOLS = {
+    "weather": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "城市名称，如'北京'、'上海'"}
+            },
+            "required": ["city"]
+        }
+    },
+    "search": {
+        "name": "web_search",
+        "description": "搜索网页获取信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词"}
+            },
+            "required": ["query"]
+        }
+    },
+    "calculator": {
+        "name": "calculate",
+        "description": "执行数学计算",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "数学表达式，如'2+2'、'sqrt(16)'"}
+            },
+            "required": ["expression"]
+        }
+    },
+    "bash": {
+        "name": "run_bash",
+        "description": "执行bash命令",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的bash命令"}
+            },
+            "required": ["command"]
+        }
+    },
+    "write": {
+        "name": "write_file",
+        "description": "将内容写入文件。当用户要求保存内容到文件时使用此工具。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径，如 'poem.md'、'output.txt'"},
+                "content": {"type": "string", "description": "要写入的内容"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    "read": {
+        "name": "read_file",
+        "description": "读取文件内容。当用户要求分析或查看文件时使用此工具。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径"}
+            },
+            "required": ["path"]
+        }
+    },
+}
+
+# 颜色输出
+class Color:
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    DIM = '\033[2m'
+    BOLD = '\033[1m'
+    END = '\033[0m'
+
+def colored(text, color):
+    """返回带颜色的文本"""
+    if not sys.stdout.isatty():
+        return text
+    return f"{color}{text}{Color.END}"
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def readline_safe_prompt(prompt: str) -> str:
+    """让带 ANSI 颜色的 prompt 在 readline 下不破坏换行/光标定位。
+
+    Python 的 readline 会把 ANSI 控制序列也计入长度，导致长文本自动换行时光标错位。
+    用 \001/\002 包裹不可见字符片段可修复该问题。
+    """
+    if not sys.stdin.isatty():
+        return prompt
+
+    try:
+        # 若 readline 不可用，直接返回
+        import readline as _  # noqa: F401
+    except Exception:
+        return prompt
+
+    def _wrap(match: re.Match[str]) -> str:
+        return f"\001{match.group(0)}\002"
+
+    return ANSI_ESCAPE_RE.sub(_wrap, prompt)
+
+
+def get_turing_dir() -> str:
+    """获取turing数据目录，不存在则创建"""
+    home = os.path.expanduser('~')
+    turing_dir = os.path.join(home, '.turing')
+    os.makedirs(turing_dir, exist_ok=True)
+    return turing_dir
+
+def get_sessions_dir() -> str:
+    """获取会话历史目录"""
+    sessions_dir = os.path.join(get_turing_dir(), 'sessions')
+    os.makedirs(sessions_dir, exist_ok=True)
+    return sessions_dir
+
+def get_input_history_path() -> str:
+    return os.path.join(get_turing_dir(), 'input_history')
+
+
+def print_box(title: str, content: str) -> None:
+    width = shutil.get_terminal_size((100, 20)).columns
+    width = max(60, min(width, 140))
+
+    label = f"[{title}]"
+    top = f"┌{label}{'─' * max(1, width - 2 - len(label))}┐"
+    bottom = f"└{'─' * (width - 2)}┘"
+    print(colored(top, Color.CYAN))
+
+    def _wrap_display(raw: str, max_w: int) -> list[str]:
+        if raw == "":
+            return [""]
+
+        out: list[str] = []
+        buf: list[str] = []
+        cur_w = 0
+        for ch in raw.replace('\t', '    '):
+            ch_w = wcwidth(ch)
+            if ch_w < 0:
+                ch_w = 0
+            if cur_w + ch_w > max_w and buf:
+                out.append(''.join(buf))
+                buf = [ch]
+                cur_w = ch_w
+                continue
+            buf.append(ch)
+            cur_w += ch_w
+        out.append(''.join(buf))
+        return out
+
+    inner_w = width - 4
+    lines = content.splitlines() or [""]
+    for raw in lines:
+        for wline in _wrap_display(raw, inner_w):
+            line_w = wcswidth(wline)
+            if line_w < 0:
+                line_w = len(wline)
+            pad = " " * max(0, inner_w - line_w)
+            print(colored("│ ", Color.CYAN) + wline + pad + colored(" │", Color.CYAN))
+
+    print(colored(bottom, Color.CYAN))
+
+
+def is_image_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+
+    suffix = path.suffix.lower().lstrip('.')
+    return suffix in {
+        'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif', 'heic'
+    }
+
+
+def encode_image_to_data_url(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    if not mime:
+        # 尽量给一个合理默认
+        mime = f"image/{path.suffix.lower().lstrip('.')}" if path.suffix else "application/octet-stream"
+
+    data = path.read_bytes()
+    b64 = base64.b64encode(data).decode('ascii')
+    return f"data:{mime};base64,{b64}"
+
+
+def extract_local_image_paths(text: str) -> tuple[str, list[Path]]:
+    """从用户输入中提取本地图片路径（用于拖拽文件到终端场景）。
+
+    支持带空格的路径（如 /path/to/图片 1.png 文字描述）
+    - 仅当 token 指向真实存在的文件且扩展名是图片时才认定为图片。
+    - 返回：移除图片路径后的文本 + 图片路径列表
+    """
+    # 仅对单行输入做自动识别，避免破坏用户多行文本格式
+    if '\n' in text:
+        return text, []
+
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError:
+        # 引号不配对等情况：保守处理，不自动提取
+        return text, []
+
+    image_paths: list[Path] = []
+    remaining: list[str] = []
+    i = 0
+
+    while i < len(tokens):
+        tok = tokens[i]
+
+        # 如果 token 以 / 开头，可能是路径的开始
+        if tok.startswith('/'):
+            # 贪婪地尝试合并后续所有 tokens，找到最长的有效图片路径
+            found_image = None
+            merged_count = 0
+
+            # 尝试从当前位置开始的所有可能的合并长度
+            for j in range(i, len(tokens)):
+                candidate = ' '.join(tokens[i:j+1])
+                p = Path(candidate).expanduser()
+
+                if is_image_file(p):
+                    # 找到有效图片，更新为最长匹配（继续尝试更长的组合）
+                    found_image = p
+                    merged_count = j - i + 1
+
+            if found_image:
+                image_paths.append(found_image)
+                i += merged_count
+                continue
+
+        # 不是图片路径，加入 remaining
+        remaining.append(tok)
+        i += 1
+
+    cleaned_text = ' '.join(remaining).strip()
+    return cleaned_text, image_paths
+
+
+def normalize_messages_for_api(messages: list[dict]) -> list[dict]:
+    """把本地 message 结构转换为 OpenAI 兼容 payload。
+
+    支持 content 为：
+    - str
+    - list[{type:'text', text:'...'} | {type:'image_file', path:'...'}]
+    """
+    out: list[dict] = []
+    for msg in messages:
+        content = msg.get('content')
+        if isinstance(content, list):
+            parts: list[dict] = []
+            for part in content:
+                if part.get('type') == 'text':
+                    text = part.get('text', '')
+                    if text:
+                        parts.append({"type": "text", "text": text})
+                elif part.get('type') == 'image_file':
+                    path_str = part.get('path')
+                    if not path_str:
+                        continue
+                    p = Path(path_str).expanduser()
+                    if not is_image_file(p):
+                        continue
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": encode_image_to_data_url(p)},
+                    })
+                elif part.get('type') == 'image_url':
+                    # 兼容已是 OpenAI 格式的历史记录
+                    image_url = part.get('image_url')
+                    if isinstance(image_url, dict) and image_url.get('url'):
+                        parts.append({"type": "image_url", "image_url": {"url": image_url["url"]}})
+                else:
+                    # 未知 part 类型：忽略
+                    continue
+
+            # 如果 parts 为空，至少给一个空文本，避免部分后端报错
+            if not parts:
+                parts = [{"type": "text", "text": ""}]
+
+            out.append({"role": msg.get('role'), "content": parts})
+        else:
+            out.append({"role": msg.get('role'), "content": content})
+
+    return out
+
+
+class StatusSpinner:
+    """请求状态显示器 - Claude Code 风格"""
+    WORDS = ["Thinking", "Processing", "Generating", "Working"]
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self._start_time = 0
+        self._char_idx = 0
+        self._word_idx = 0
+
+    def _animate(self):
+        chars = ["·", ":", "·"]
+        while not self._stop.is_set():
+            elapsed = int(time.time() - self._start_time)
+            if elapsed < 60:
+                time_str = f"{elapsed}s"
+            else:
+                time_str = f"{elapsed // 60}m {elapsed % 60}s"
+
+            word = self.WORDS[self._word_idx % len(self.WORDS)]
+            char = chars[self._char_idx % len(chars)]
+
+            status = f"\r\033[K{colored('*', Color.YELLOW)} {word}{char * 3} {colored(f'(ctrl+c to interrupt · {time_str})', Color.DIM)}"
+            sys.stdout.write(status)
+            sys.stdout.flush()
+
+            self._char_idx += 1
+            if self._char_idx % 10 == 0:
+                self._word_idx += 1
+            self._stop.wait(0.15)
+
+    def start(self):
+        self._start_time = time.time()
+        self._stop.clear()
+        self._char_idx = 0
+        self._word_idx = 0
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+
+TIPS = [
+    "git commit -m 'fix' 后发现还有 bug，这是宿命",
+    "代码能跑就不要动，除非你想加班",
+    "没有什么是重启解决不了的",
+    "今天写的代码，明天就看不懂了",
+    "与其优化代码，不如优化需求",
+    "deadline 是第一生产力",
+    "好代码自己会说话，坏代码需要注释",
+    "先让它跑，再让它对，最后让它快",
+    "一个 TODO 放三年，就成了 TODON'T",
+    "If it works, don't touch it",
+    "99 个 bug 修完，还剩 127 个",
+    "程序员最讨厌的两件事：写注释和没注释",
+    "这段代码为什么能跑？别问，问就是玄学",
+    "rm -rf / 一时爽，一直 rm 一直爽？",
+    "你的代码不是屎山，是屎喜马拉雅",
+    "Talk is cheap, show me the code",
+    "It works on my machine",
+    "永远不要相信用户输入",
+    "复制粘贴，程序员的核心竞争力",
+    "写代码一时爽，重构火葬场",
+]
+
+def get_tip():
+    """根据时间戳选择段子，每次启动不同"""
+    idx = int(time.time()) % len(TIPS)
+    return TIPS[idx]
+
+
+# ============== 偏好持久化 ==============
+def get_preferences_path():
+    """获取偏好文件路径"""
+    return os.path.expanduser("~/.turing/GCHAT.md")
+
+def load_preferences():
+    """加载 GCHAT.md 作为系统提示
+
+    类似 Claude Code 的 CLAUDE.md，用于存储用户偏好和项目上下文
+    """
+    path = get_preferences_path()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+            if content:
+                return content
+        except Exception:
+            pass
+    return None
+
+
+# ============== 上下文压缩 ==============
+# 压缩配置
+CONTEXT_CONFIG = {
+    "max_messages": 20,       # 最大消息数
+    "compress_threshold": 16, # 触发压缩的阈值
+    "preserve_recent": 6,     # 保留最近N条消息不压缩
+    "summary_max_len": 500,   # 摘要最大长度
+}
+
+def estimate_tokens(text):
+    """粗略估算 token 数（中文约1.5字/token，英文约4字符/token）"""
+    if not text:
+        return 0
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    other_chars = len(text) - chinese_chars
+    return int(chinese_chars * 1.5 + other_chars / 4)
+
+def compress_context(messages, backend_config, model):
+    """智能上下文压缩 - 借鉴 Claude Code 的 wU2 压缩策略
+
+    当消息数超过阈值时：
+    1. 保留 system 消息
+    2. 保留最近 N 条消息
+    3. 将旧消息压缩为摘要
+    """
+    if len(messages) < CONTEXT_CONFIG["compress_threshold"]:
+        return messages, False
+
+    # 分离 system 消息和对话消息
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    chat_msgs = [m for m in messages if m.get("role") != "system"]
+
+    if len(chat_msgs) < CONTEXT_CONFIG["compress_threshold"]:
+        return messages, False
+
+    # 保留最近的消息
+    preserve_count = CONTEXT_CONFIG["preserve_recent"]
+    old_msgs = chat_msgs[:-preserve_count]
+    recent_msgs = chat_msgs[-preserve_count:]
+
+    # 生成摘要
+    summary = generate_context_summary(old_msgs, backend_config, model)
+
+    if summary:
+        # 构建压缩后的消息列表
+        compressed = system_msgs.copy()
+        compressed.append({
+            "role": "system",
+            "content": f"[对话历史摘要]\n{summary}\n[以上为早期对话摘要，以下为最近对话]"
+        })
+        compressed.extend(recent_msgs)
+        return compressed, True
+
+    # 压缩失败，返回原消息但截断
+    return system_msgs + chat_msgs[-CONTEXT_CONFIG["max_messages"]:], False
+
+def generate_context_summary(messages, backend_config, model):
+    """生成对话摘要"""
+    if not messages:
+        return None
+
+    # 构建要摘要的内容
+    content_parts = []
+    for msg in messages:
+        role = "用户" if msg.get("role") == "user" else "AI"
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # 多模态消息，只取文本部分
+            content = " ".join([p.get("text", "") for p in content if p.get("type") == "text"])
+        # 截断过长的单条消息
+        if len(content) > 200:
+            content = content[:200] + "..."
+        content_parts.append(f"{role}: {content}")
+
+    dialog_text = "\n".join(content_parts)
+
+    # 如果对话太短，不需要摘要
+    if len(dialog_text) < 300:
+        return None
+
+    # 使用 API 生成摘要
+    summary_prompt = f"""请用1-3句话简洁总结以下对话的主要内容和关键信息，不要遗漏重要细节：
+
+{dialog_text[:2000]}
+
+摘要："""
+
+    try:
+        summary_messages = [{"role": "user", "content": summary_prompt}]
+        # 使用非流式请求获取摘要
+        result = chat_request(summary_messages, model, backend_config, retry=1, debug=False)
+        if result and not result.startswith("["):
+            # 限制摘要长度
+            return result[:CONTEXT_CONFIG["summary_max_len"]]
+    except Exception:
+        pass
+
+    # API 调用失败，返回简单摘要
+    turns = len(messages) // 2
+    return f"[早期对话 {turns} 轮，内容已压缩]"
+
+
+LOGO_LINES = [
+    " ██████╗   ██████╗ ██╗  ██╗  █████╗ ████████╗",
+    "██╔════╝  ██╔════╝ ██║  ██║ ██╔══██╗╚══██╔══╝",
+    "██║  ███╗ ██║      ███████║ ███████║   ██║   ",
+    "██║   ██║ ██║      ██╔══██║ ██╔══██║   ██║   ",
+    "╚██████╔╝ ╚██████╗ ██║  ██║ ██║  ██║   ██║   ",
+    " ╚═════╝   ╚═════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝   ╚═╝   ",
+]
+
+def get_recent_sessions(limit=3):
+    """获取最近的会话"""
+    sessions_dir = os.path.expanduser("~/.turing/sessions")
+    if not os.path.exists(sessions_dir):
+        return []
+
+    files = []
+    for f in os.listdir(sessions_dir):
+        if f.endswith('.json'):
+            path = os.path.join(sessions_dir, f)
+            files.append((os.path.getmtime(path), f, path))
+
+    files.sort(reverse=True)
+
+    recent = []
+    for mtime, fname, path in files[:limit]:
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+
+            # 支持两种格式：直接数组 或 {messages: [...]}
+            messages = data.get('messages', data) if isinstance(data, dict) else data
+
+            if messages and len(messages) > 0:
+                first_msg = ""
+                for msg in messages:
+                    if msg.get('role') == 'user':
+                        content = msg.get('content', '')
+                        if isinstance(content, list):  # multimodal content
+                            content = str(content[0].get('text', '')) if content else ''
+                        first_msg = content[:22]
+                        if len(content) > 22:
+                            first_msg += "..."
+                        break
+                if first_msg:
+                    time_str = time.strftime("%m/%d %H:%M", time.localtime(mtime))
+                    recent.append((time_str, first_msg))
+        except:
+            pass
+
+    return recent
+
+def get_git_info():
+    """获取当前目录的Git信息"""
+    try:
+        import subprocess
+        # 检查是否在git仓库中
+        result = subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'],
+                              capture_output=True, text=True, timeout=2)
+        if result.returncode != 0:
+            return None
+
+        # 获取分支名
+        result = subprocess.run(['git', 'branch', '--show-current'],
+                              capture_output=True, text=True, timeout=2)
+        branch = result.stdout.strip() if result.returncode == 0 else "unknown"
+
+        # 获取状态（简短）
+        result = subprocess.run(['git', 'status', '--porcelain'],
+                              capture_output=True, text=True, timeout=2)
+        changes = len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
+
+        return {"branch": branch, "changes": changes}
+    except:
+        return None
+
+def print_header():
+    """打印欢迎信息 - Claude Code 风格带边框窗口"""
+    import re
+    import shutil
+
+    # 获取终端宽度（多种方式尝试）
+    term_width = 80
+    try:
+        # 方法1: shutil（最可靠）
+        size = shutil.get_terminal_size()
+        term_width = size.columns
+    except:
+        pass
+
+    # 方法2: 环境变量备选
+    if term_width <= 0:
+        term_width = int(os.environ.get('COLUMNS', 80))
+
+    # 方法3: tput (macOS/Linux)
+    if term_width == 80:  # 可能是默认值，尝试 tput
+        try:
+            import subprocess
+            result = subprocess.run(['tput', 'cols'], capture_output=True, text=True, timeout=1)
+            if result.returncode == 0 and result.stdout.strip().isdigit():
+                term_width = int(result.stdout.strip())
+        except:
+            pass
+
+    # Logo固定宽度46字符，计算右侧面板宽度
+    logo_width = 46
+    # 内容宽度 = 终端宽度 - 2(左右边框) - 1(中间分隔)
+    inner_width = term_width - 3
+    left_width = logo_width
+    right_width = inner_width - left_width
+
+    # 如果终端太窄，不显示右侧面板
+    show_right_panel = right_width >= 20
+
+    if not show_right_panel:
+        # 窄屏模式：只显示Logo
+        inner_width = logo_width
+        left_width = logo_width
+        right_width = 0
+
+    # 获取数据
+    recent = get_recent_sessions(2)
+    tip = get_tip()
+    git_info = get_git_info()
+    cwd = os.getcwd()
+
+    # 边框字符
+    TL, TR, BL, BR = '╭', '╮', '╰', '╯'
+    H, V = '─', '│'
+    VL, VR, TD, TU = '├', '┤', '┬', '┴'
+
+    def visible_len(s):
+        """计算去除ANSI码后的可见长度（考虑中文宽字符）"""
+        # 去除ANSI转义码
+        text = re.sub(r'\x1b\[[0-9;]*m', '', str(s))
+        width = 0
+        for char in text:
+            code = ord(char)
+            # 中文和全角字符占2格
+            if (0x4E00 <= code <= 0x9FFF or    # CJK统一汉字
+                0x3000 <= code <= 0x303F or    # CJK标点
+                0xFF00 <= code <= 0xFFEF):     # 全角字符
+                width += 2
+            else:
+                width += 1
+        return width
+
+    def pad_right(text, width):
+        """右侧填充到指定宽度"""
+        vlen = visible_len(text)
+        return text + " " * max(0, width - vlen)
+
+    # 构建右侧内容
+    right_lines = []
+    if show_right_panel:
+        max_text_len = right_width - 3  # 留出边距
+
+        # 当前目录 (用 > 代替 emoji，避免宽度问题)
+        cwd_short = cwd if len(cwd) <= max_text_len - 2 else "..." + cwd[-(max_text_len-5):]
+        right_lines.append(colored("> ", Color.YELLOW) + colored(cwd_short, Color.DIM))
+
+        # Git 信息
+        if git_info:
+            branch = git_info['branch'][:max_text_len-10]
+            git_str = f"* {branch}"
+            if git_info['changes'] > 0:
+                git_str += f" ({git_info['changes']} changed)"
+            right_lines.append(colored(git_str, Color.GREEN))
+        else:
+            right_lines.append(colored("* (not a git repo)", Color.DIM))
+
+        # 空行
+        right_lines.append("")
+
+        # 最近会话
+        right_lines.append(colored("Recent Sessions", Color.BOLD))
+        if recent:
+            for r in recent[:2]:
+                session_text = f"  {r[0]} {r[1][:max_text_len-14]}"
+                right_lines.append(colored(session_text, Color.DIM))
+        else:
+            right_lines.append(colored("  (no recent sessions)", Color.DIM))
+            right_lines.append("")
+
+        # 补齐行数
+        while len(right_lines) < 6:
+            right_lines.append("")
+
+    # 顶部边框
+    if show_right_panel:
+        print(colored(TL + H * left_width + TD + H * right_width + TR, Color.DIM))
+    else:
+        print(colored(TL + H * inner_width + TR, Color.DIM))
+
+    # Logo区域（左侧）+ 信息（右侧）
+    for i, logo_line in enumerate(LOGO_LINES):
+        # 左侧：Logo
+        left_content = " " + colored(logo_line, Color.MAGENTA)
+        left_content = pad_right(left_content, left_width)
+
+        if show_right_panel:
+            # 右侧：内容
+            right_text = right_lines[i] if i < len(right_lines) else ""
+            right_content = " " + right_text
+            right_content = pad_right(right_content, right_width)
+            print(colored(V, Color.DIM) + left_content + colored(V, Color.DIM) + right_content + colored(V, Color.DIM))
+        else:
+            print(colored(V, Color.DIM) + left_content + colored(V, Color.DIM))
+
+    # 分隔线
+    total_inner = left_width + right_width + (1 if show_right_panel else 0)
+    if show_right_panel:
+        print(colored(VL + H * left_width + TU + H * right_width + VR, Color.DIM))
+    else:
+        print(colored(VL + H * inner_width + VR, Color.DIM))
+
+    # Tip 行 (用 * 代替 emoji)
+    tip_max = total_inner - 4
+    tip_line = colored(" * ", Color.YELLOW) + colored(tip[:tip_max], Color.DIM)
+    tip_line = pad_right(tip_line, total_inner)
+    print(colored(V, Color.DIM) + tip_line + colored(V, Color.DIM))
+
+    # 分隔线
+    print(colored(VL + H * total_inner + VR, Color.DIM))
+
+    # 底部信息行
+    info_text = " v5.0  ·  turing-cli  ·  /help for commands "
+    info_line = pad_right(colored(info_text, Color.CYAN), total_inner)
+    print(colored(V, Color.DIM) + info_line + colored(V, Color.DIM))
+
+    # 底部边框
+    print(colored(BL + H * total_inner + BR, Color.DIM))
+    print()
+
+def print_help():
+    """打印帮助信息 - Claude Code 风格"""
+    print(colored("\n命令前缀: 支持 : 或 / (例如 :help 或 /help)\n", Color.CYAN))
+    sections = [
+        ("Commands", [
+            (":help", "show help"),
+            (":quit", "exit (auto-save)"),
+            (":clear", "clear chat history"),
+            (":history", "show chat history"),
+        ]),
+        ("Files", [
+            (":read <file>", "read file for AI analysis"),
+            (":write <file>", "save last AI reply to file"),
+            (":img <path>", "analyze image"),
+        ]),
+        ("Sessions", [
+            (":sessions", "list saved sessions"),
+            (":save <file>", "save chat manually"),
+            (":load <file>", "load chat"),
+        ]),
+        ("Settings", [
+            (":model <name>", "switch model (flash/pro/pro3)"),
+            (":backend <name>", "switch backend"),
+            (":stream", "toggle streaming"),
+            (":spinner", "toggle spinner animation"),
+            (":mode [box]", "toggle input mode"),
+            (":prefs [edit]", "manage preferences (GCHAT.md)"),
+            (":status", "show current status"),
+        ]),
+    ]
+
+    print()
+    for section_name, items in sections:
+        print(colored(f"  {section_name}", Color.BOLD))
+        for cmd, desc in items:
+            print(colored(f"    {cmd:<18}", Color.CYAN) + colored(desc, Color.DIM))
+        print()
+
+    print(colored("  Shortcuts", Color.BOLD))
+    print(colored("    Ctrl+C", Color.CYAN) + colored("            save & continue", Color.DIM))
+    print(colored("    Ctrl+D", Color.CYAN) + colored("            exit (auto-save)", Color.DIM))
+    print()
+    print(colored(f"  Storage: ~/.turing/sessions/", Color.DIM))
+    print()
+
+def official_api_request(messages, model, tools=None, api_key=None):
+    """使用Google官方API发送请求（支持Function Calling）"""
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+
+    if not api_key:
+        return None, "[错误] 未设置 GEMINI_API_KEY 环境变量\n设置方法: export GEMINI_API_KEY='your-api-key'"
+
+    # 映射到官方模型名
+    official_model = OFFICIAL_MODEL_MAP.get(model, "gemini-2.5-flash-lite")
+
+    # 构建官方API格式的请求
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{official_model}:generateContent?key={api_key}"
+
+    # 转换消息格式 (OpenAI -> Gemini)
+    contents = []
+    for msg in messages:
+        role = "user" if msg["role"] == "user" else "model"
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            contents.append({"role": role, "parts": [{"text": content}]})
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if part.get("type") == "text":
+                    parts.append({"text": part.get("text", "")})
+            if parts:
+                contents.append({"role": role, "parts": parts})
+
+    payload = {"contents": contents}
+
+    # 添加工具定义
+    if tools:
+        payload["tools"] = [{"function_declarations": tools}]
+
+    curl_cmd = [
+        'curl', '-s', '-X', 'POST', url,
+        '-H', 'Content-Type: application/json',
+        '--max-time', '60',
+        '-d', json.dumps(payload)
+    ]
+
+    try:
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=65)
+
+        if result.returncode != 0:
+            return None, f"[curl错误 {result.returncode}]: {result.stderr}"
+
+        response_data = json.loads(result.stdout)
+
+        # 检查错误
+        if "error" in response_data:
+            error = response_data["error"]
+            return None, f"[API错误]: {error.get('message', json.dumps(error))}"
+
+        # 解析响应
+        candidates = response_data.get("candidates", [])
+        if not candidates:
+            return None, "[错误] 无响应内容"
+
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+
+        for part in parts:
+            # 检查是否有函数调用
+            if "functionCall" in part:
+                fc = part["functionCall"]
+                return {
+                    "type": "function_call",
+                    "name": fc.get("name"),
+                    "args": fc.get("args", {})
+                }, None
+            # 普通文本响应
+            if "text" in part:
+                return {"type": "text", "content": part["text"]}, None
+
+        # 调试：打印实际响应结构
+        return None, f"[错误] 无法解析响应: {json.dumps(response_data, ensure_ascii=False)[:500]}"
+
+    except subprocess.TimeoutExpired:
+        return None, "[超时]: 官方API请求超过60秒"
+    except json.JSONDecodeError as e:
+        return None, f"[JSON解析错误]: {e}"
+    except Exception as e:
+        return None, f"[错误]: {e}"
+
+
+def openai_tools_request(messages, model, tools, backend_config, retry=2):
+    """发送带工具的请求（OpenAI 格式，用于 google 后端）"""
+    url = backend_config["url"]
+
+    # 转换工具格式
+    openai_tools = []
+    for tool in tools:
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {"type": "object", "properties": {}})
+            }
+        })
+
+    payload = {
+        "model": model,
+        "messages": normalize_messages_for_api(messages),
+        "tools": openai_tools
+    }
+
+    curl_cmd = [
+        'curl', '-s', '-X', 'POST', url,
+        '-H', 'Content-Type: application/json',
+        '--max-time', '120',
+        '-d', json.dumps(payload)
+    ]
+
+    try:
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=125)
+
+        if result.returncode != 0:
+            return None, f"[curl错误 {result.returncode}]: {result.stderr}"
+
+        response_data = json.loads(result.stdout)
+
+        if "error" in response_data:
+            return None, f"[API错误]: {response_data['error'].get('message', str(response_data['error']))}"
+
+        choice = response_data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+
+        # 检查是否有工具调用
+        if "tool_calls" in message and message["tool_calls"]:
+            tc = message["tool_calls"][0]
+            func = tc.get("function", {})
+            return {
+                "type": "function_call",
+                "name": func.get("name"),
+                "args": json.loads(func.get("arguments", "{}"))
+            }, None
+
+        # 普通文本响应
+        content = message.get("content", "")
+        if content:
+            return {"type": "text", "content": content}, None
+
+        # 调试：打印实际响应结构
+        return None, f"[错误] 无法解析响应: {json.dumps(response_data, ensure_ascii=False)[:500]}"
+
+    except subprocess.TimeoutExpired:
+        return None, "[超时]: 请求超过120秒"
+    except json.JSONDecodeError as e:
+        return None, f"[JSON解析错误]: {e}\n响应: {result.stdout[:300]}"
+    except Exception as e:
+        return None, f"[错误]: {e}"
+
+
+def chat_request(messages, model, backend_config, retry=2, debug=False, show_spinner=True):
+    """发送聊天请求（使用curl，兼容性最好）"""
+    url = backend_config["url"]
+    payload = {
+        "model": model,
+        "messages": normalize_messages_for_api(messages),
+    }
+
+    # 构建curl命令
+    curl_cmd = [
+        'curl', '-X', 'POST', url,
+        '-H', 'Content-Type: application/json',
+        '--max-time', '120',
+        '--retry', str(retry),  # 自动重试
+        '--retry-delay', '2',    # 重试间隔2秒
+        '--connect-timeout', '30'  # 连接超时30秒
+    ]
+
+    # 调试模式显示详细信息
+    if not debug:
+        curl_cmd.insert(1, '-s')  # 静默模式
+
+    # 如果有API key，添加Authorization header
+    if "key" in backend_config:
+        curl_cmd.extend(['-H', f'Authorization: Bearer {backend_config["key"]}'])
+
+    # 添加请求体
+    curl_cmd.extend(['-d', json.dumps(payload)])
+
+    spinner = StatusSpinner() if show_spinner else None
+
+    try:
+        if spinner:
+            spinner.start()
+
+        # 执行curl命令
+        result = subprocess.run(
+            curl_cmd,
+            capture_output=True,
+            text=True,
+            timeout=125
+        )
+
+        if spinner:
+            spinner.stop()
+
+        if result.returncode != 0:
+            stderr_msg = result.stderr.strip() if result.stderr else "网络连接失败"
+
+            # 针对 curl 35 错误给出具体建议
+            if result.returncode == 35:
+                return (
+                    f"[SSL/TLS错误 35]: {stderr_msg}\n\n"
+                    f"可能原因:\n"
+                    f"1. 网络环境问题（WiFi不稳定、VPN干扰）\n"
+                    f"2. DNS解析问题\n"
+                    f"3. 防火墙/安全软件阻止\n\n"
+                    f"建议:\n"
+                    f"- 重试几次（可能是瞬时网络波动）\n"
+                    f"- 切换网络（WiFi → 有线 或 手机热点）\n"
+                    f"- 检查API配置是否正确\n"
+                    f"- 或使用本地后端: turing -b local"
+                )
+
+            return f"[curl错误 {result.returncode}]: {stderr_msg}\n提示: 请检查网络连接后重试"
+
+        # 解析JSON响应
+        response_data = json.loads(result.stdout)
+
+        # 检查是否有错误
+        if "error" in response_data:
+            error = response_data["error"]
+            error_msg = error.get("message", "")
+            error_type = error.get("type", "")
+            error_code = error.get("code", "")
+
+            # 构建详细错误信息
+            if error_msg:
+                return f"[API错误]: {error_msg}"
+            elif error_type or error_code:
+                return f"[API错误]: {error_type or error_code}\n详情: {json.dumps(error, ensure_ascii=False)}"
+            else:
+                return f"[API错误]: {json.dumps(error, ensure_ascii=False)}"
+
+        # 返回AI回复
+        return response_data["choices"][0]["message"]["content"]
+
+    except subprocess.TimeoutExpired:
+        if spinner:
+            spinner.stop()
+        return f"[超时]: 请求超过120秒"
+    except json.JSONDecodeError as e:
+        if spinner:
+            spinner.stop()
+        return f"[JSON解析错误]: {str(e)}\n响应: {result.stdout[:200]}"
+    except Exception as e:
+        if spinner:
+            spinner.stop()
+        return f"[错误]: {str(e)}"
+
+def resolve_model(model_input):
+    """解析模型名称"""
+    return MODEL_ALIASES.get(model_input, model_input)
+
+
+def chat_request_with_fallback(messages, model, backend_config, retry=2, debug=False, quiet=False, show_spinner=True):
+    """发送聊天请求，失败时自动降级到备用模型"""
+    # 第一次尝试：使用主模型
+    response = chat_request(messages, model, backend_config, retry=retry, debug=debug, show_spinner=show_spinner)
+
+    # 检查是否失败（错误响应以 [ 开头）
+    if response.startswith("[") and model in FALLBACK_MODELS:
+        fallback_model = FALLBACK_MODELS[model]
+        if not quiet:
+            print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
+        response = chat_request(messages, fallback_model, backend_config, retry=retry, debug=debug, show_spinner=show_spinner)
+        if not response.startswith("[") and not quiet:
+            print(f"✅ 降级成功，使用 {fallback_model} 响应\n")
+
+    return response
+
+
+def chat_request_stream(messages, model, backend_config, debug=False, show_spinner=True):
+    """流式发送聊天请求，兼容 SSE 流和完整 JSON 响应"""
+    url = backend_config["url"]
+    payload = {
+        "model": model,
+        "messages": normalize_messages_for_api(messages),
+        "stream": True,
+    }
+
+    # 构建curl命令
+    curl_cmd = [
+        'curl', '-X', 'POST', url,
+        '-H', 'Content-Type: application/json',
+        '-H', 'Accept: text/event-stream',
+        '--max-time', '300',
+        '--connect-timeout', '30',
+        '-N',  # 禁用缓冲
+    ]
+
+    if not debug:
+        curl_cmd.insert(1, '-s')
+
+    if "key" in backend_config:
+        curl_cmd.extend(['-H', f'Authorization: Bearer {backend_config["key"]}'])
+
+    curl_cmd.extend(['-d', json.dumps(payload)])
+
+    spinner = StatusSpinner() if show_spinner else None
+
+    # 耗时统计
+    start_time = time.time()
+    ttfb_time = None  # Time to First Byte
+
+    try:
+        if spinner:
+            spinner.start()
+
+        process = subprocess.Popen(
+            curl_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        full_response = ""
+        raw_output = ""
+        first_content = True
+
+        for line in process.stdout:
+            raw_output += line
+            line = line.strip()
+            if not line:
+                continue
+
+            # 尝试 SSE 格式
+            if line.startswith("data: "):
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    if "choices" in chunk and chunk["choices"]:
+                        delta = chunk["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            if first_content and spinner:
+                                spinner.stop()
+                                ttfb_time = time.time() - start_time
+                                first_content = False
+                            print(content, end="", flush=True)
+                            full_response += content
+                except json.JSONDecodeError:
+                    continue
+
+        process.wait()
+
+        # 如果没有 SSE 流数据，尝试解析完整 JSON
+        if not full_response and raw_output.strip():
+            if spinner:
+                spinner.stop()
+            try:
+                result = json.loads(raw_output.strip())
+                if "choices" in result and result["choices"]:
+                    content = result["choices"][0].get("message", {}).get("content", "")
+                    if content:
+                        print(content)
+                        return content
+            except json.JSONDecodeError:
+                pass
+
+        if full_response:
+            print()  # 换行
+            # 显示耗时统计
+            total_time = time.time() - start_time
+            ttfb_str = f"{ttfb_time:.1f}s" if ttfb_time else "N/A"
+            print(colored(f"  ⏱ TTFB: {ttfb_str} | Total: {total_time:.1f}s", Color.DIM))
+        return full_response if full_response else "[无响应]"
+
+    except Exception as e:
+        if spinner:
+            spinner.stop()
+        return f"[流式请求错误]: {str(e)}"
+    finally:
+        if spinner and first_content:  # spinner 还在运行
+            spinner.stop()
+
+
+def chat_request_with_fallback_stream(messages, model, backend_config, debug=False, show_spinner=True, quiet=False):
+    """流式请求，失败时降级"""
+    response = chat_request_stream(messages, model, backend_config, debug=debug, show_spinner=show_spinner)
+
+    if response.startswith("[") and model in FALLBACK_MODELS:
+        fallback_model = FALLBACK_MODELS[model]
+        if not quiet:
+            print(f"\n⚠️  {model} 请求失败，降级到 {fallback_model}...")
+        response = chat_request_stream(messages, fallback_model, backend_config, debug=debug, show_spinner=show_spinner)
+
+    return response
+
+
+def auto_save_history(messages, model):
+    """自动保存会话历史到 ~/.turing/sessions/"""
+    if not messages or len(messages) == 0:
+        return  # 没有对话内容，不保存
+
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(get_sessions_dir(), f"turing_history_{timestamp}.json")
+
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                "model": model,
+                "messages": messages,
+                "timestamp": timestamp
+            }, f, ensure_ascii=False, indent=2)
+        print(colored(f"💾 会话已自动保存到: {filename}", Color.GREEN))
+    except Exception as e:
+        print(colored(f"⚠️  自动保存失败: {e}", Color.RED))
+
+def load_latest_history():
+    """加载最新的会话历史"""
+    import glob
+
+    sessions_dir = get_sessions_dir()
+    history_files = glob.glob(os.path.join(sessions_dir, "turing_history_*.json"))
+    if not history_files:
+        return None, None, None
+
+    # 按文件名排序（文件名包含时间戳，自然排序即可）
+    latest_file = sorted(history_files)[-1]
+
+    try:
+        with open(latest_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get("messages", []), data.get("model", "gemini-3-flash-preview"), latest_file
+    except Exception as e:
+        print(colored(f"⚠️  加载会话失败: {e}", Color.RED))
+        return None, None, None
+
+
+def list_sessions():
+    """列出所有会话"""
+    sessions_dir = get_sessions_dir()
+    history_files = glob_module.glob(os.path.join(sessions_dir, "turing_history_*.json"))
+
+    if not history_files:
+        print(colored("没有保存的会话", Color.YELLOW))
+        return []
+
+    sessions = []
+    for f in sorted(history_files, reverse=True):
+        try:
+            with open(f, 'r', encoding='utf-8') as fp:
+                data = json.load(fp)
+                msg_count = len(data.get("messages", []))
+                model = data.get("model", "unknown")
+                timestamp = data.get("timestamp", "")
+                # 获取第一条用户消息作为预览
+                preview = ""
+                for msg in data.get("messages", []):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            preview = content[:50] + "..." if len(content) > 50 else content
+                        break
+                sessions.append({
+                    "file": f,
+                    "timestamp": timestamp,
+                    "model": model,
+                    "msg_count": msg_count,
+                    "preview": preview
+                })
+        except Exception:
+            continue
+
+    return sessions
+
+
+def read_file_content(file_path):
+    """读取文件内容用于AI分析"""
+    path = Path(file_path).expanduser()
+    if not path.exists():
+        return None, f"文件不存在: {file_path}"
+
+    # 检查是否是图片
+    if is_image_file(path):
+        return {"type": "image", "path": str(path)}, None
+
+    # 读取文本文件
+    try:
+        # 限制文件大小 (最大 500KB)
+        if path.stat().st_size > 500 * 1024:
+            return None, f"文件过大 (>{500}KB): {file_path}"
+
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        return {"type": "text", "content": content, "path": str(path)}, None
+    except Exception as e:
+        return None, f"读取失败: {e}"
+
+
+def write_to_file(file_path, content):
+    """将内容写入文件"""
+    path = Path(file_path).expanduser()
+    try:
+        # 确保目录存在
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True, str(path)
+    except Exception as e:
+        return False, str(e)
+
+
+def execute_function(name, args):
+    """执行函数调用（模拟实现）"""
+    if name == "get_weather":
+        city = args.get("city", "未知")
+        # 模拟天气数据
+        return {"city": city, "temperature": "15°C", "condition": "晴", "humidity": "45%"}
+    elif name == "web_search":
+        query = args.get("query", "")
+        return {"results": [f"关于 '{query}' 的搜索结果...", "更多内容请访问搜索引擎"]}
+    elif name == "calculate":
+        expr = args.get("expression", "0")
+        try:
+            # 安全的数学计算
+            import math
+            allowed = {"sqrt": math.sqrt, "sin": math.sin, "cos": math.cos, "tan": math.tan,
+                      "log": math.log, "exp": math.exp, "abs": abs, "round": round, "pow": pow}
+            result = eval(expr, {"__builtins__": {}}, allowed)
+            return {"expression": expr, "result": result}
+        except Exception as e:
+            return {"error": str(e)}
+    elif name == "run_bash":
+        command = args.get("command", "")
+        try:
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+            return {"command": command, "stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+        except Exception as e:
+            return {"error": str(e)}
+    elif name == "write_file":
+        path = args.get("path", "")
+        content = args.get("content", "")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return {"success": True, "path": path, "message": f"已写入 {len(content)} 字符到 {path}"}
+        except Exception as e:
+            return {"error": str(e)}
+    elif name == "read_file":
+        path = args.get("path", "")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return {"success": True, "path": path, "content": content[:5000]}  # 限制长度
+        except Exception as e:
+            return {"error": str(e)}
+    else:
+        return {"error": f"未知函数: {name}"}
+
+
+def interactive_mode(model, backend_name, continue_session=False):
+    """交互式多轮会话"""
+    backend_config = BACKENDS[backend_name]
+    model = resolve_model(model)
+    messages = []
+    loaded_file = None
+    # 默认不启用工具，避免普通消息走工具调用路径
+    # 用户可通过 /tools add read 手动启用
+    enabled_tools = []
+    use_stream = True   # 默认启用流式输出
+    show_spinner = False  # 默认不显示 spinner
+
+    # 加载用户偏好 (GCHAT.md) 作为系统提示
+    preferences = load_preferences()
+    if preferences:
+        messages.append({"role": "system", "content": preferences})
+        print(colored("○", Color.DIM) + " Loaded: " + colored("~/.turing/GCHAT.md", Color.CYAN))
+
+    # 如果是继续会话模式，尝试加载最近的历史
+    if continue_session:
+        loaded_messages, loaded_model, loaded_file = load_latest_history()
+        if loaded_messages:
+            # 保留 system 消息，追加历史对话
+            if preferences:
+                # 过滤掉历史中的 system 消息，避免重复
+                loaded_messages = [m for m in loaded_messages if m.get("role") != "system"]
+            messages.extend(loaded_messages)
+            if loaded_model:
+                model = loaded_model
+            print(colored("○", Color.DIM) + f" Loaded: {colored(loaded_file, Color.DIM)}")
+            print(colored("○", Color.DIM) + f" Messages: {colored(f'{len(messages)} ({len(messages)//2} turns)', Color.DIM)}")
+            print()
+
+    print_header()
+    # 状态层 - 紧凑单行显示
+    session_status = 'continuing' if (continue_session and loaded_file) else 'new'
+    status_line = (
+        colored("  model:", Color.DIM) + colored(f" {model}", Color.CYAN) +
+        colored("  session:", Color.DIM) + colored(f" {session_status}", Color.GREEN)
+    )
+    print(status_line)
+    print()
+
+    input_mode = 'normal'  # normal | box
+    history = None
+    # 检查终端可用性 - 同时检查 stdin 和 stdout
+    is_interactive = sys.stdin.isatty() or sys.stdout.isatty()
+    if pt_prompt and FileHistory:
+        try:
+            history = FileHistory(get_input_history_path())
+        except Exception:
+            history = None
+
+    def prompt_text() -> str:
+        # Claude Code 风格输入框
+        if input_mode == 'box':
+            return colored("› ", Color.MAGENTA + Color.BOLD) + colored("[box] ", Color.DIM)
+        return colored("› ", Color.MAGENTA + Color.BOLD)
+
+    # 粘贴计数器（用于显示 [Pasted text #1 +N lines]）
+    paste_counter = [0]
+    # 图片附件状态
+    image_attachment = {"path": None, "selected": False}
+
+    def read_user_message(force_box: bool = False, default_text: str = "") -> str | None:
+        """读取用户输入。Claude Code 风格：支持图片附件预览。"""
+        use_box = force_box or (input_mode == 'box')
+
+        if pt_prompt and KeyBindings:
+            kb = KeyBindings()
+            cancel_token = "__CANCEL__"
+
+            # 重置图片状态
+            image_attachment["path"] = None
+            image_attachment["selected"] = False
+
+            @kb.add('c-g')
+            def _(event):
+                event.app.exit(result=cancel_token)
+
+            @kb.add('c-c')
+            def _(event):
+                buf = event.current_buffer
+                if buf.text:
+                    buf.reset()
+                    return
+                event.app.exit(result=cancel_token)
+
+            @kb.add('c-s')
+            def _(event):
+                event.current_buffer.validate_and_handle()
+
+            # 图片选择：↑ 选择图片，↓ 取消选择
+            @kb.add('up')
+            def _(event):
+                if image_attachment["path"]:
+                    image_attachment["selected"] = True
+                    # 刷新界面
+                    if hasattr(event.app, 'renderer'):
+                        event.app.renderer.clear()
+
+            @kb.add('down')
+            def _(event):
+                if image_attachment["path"]:
+                    image_attachment["selected"] = False
+                    # 刷新界面
+                    if hasattr(event.app, 'renderer'):
+                        event.app.renderer.clear()
+
+            @kb.add('enter')
+            def _(event):
+                buf = event.current_buffer
+                text = buf.text
+
+                # Claude Code 风格：行末 \ 继续换行，否则 Enter 直接发送
+                if text.endswith('\\'):
+                    buf.delete_before_cursor(count=1)
+                    buf.insert_text('\n')
+                    return
+
+                buf.validate_and_handle()
+
+            prompt_obj = PTANSI(prompt_text()) if PTANSI else prompt_text()
+
+            # 占位提示文字
+            placeholder_text = HTML('<style fg="ansibrightblack">Type message or :help for commands</style>') if HTML else None
+
+            # 底部状态栏（包含图片信息）
+            def get_toolbar():
+                msg_count = len(messages)
+                turns = msg_count // 2
+                stream_status = "stream on" if use_stream else "stream off"
+
+                # 图片信息
+                image_info = ""
+                if image_attachment["path"]:
+                    filename = Path(image_attachment["path"]).name
+                    status = "✓" if image_attachment["selected"] else " "
+                    image_info = f"  [{status} Image: {filename} (↑/↓ to toggle)]"
+
+                return HTML(f'<style fg="ansibrightblack">  {model}  ·  {turns} turns  ·  {stream_status}{image_info}</style>')
+
+            toolbar_func = get_toolbar if HTML else None
+
+            # 实时刷新的 rprompt（显示图片提示）
+            def get_rprompt():
+                if image_attachment["path"] and not image_attachment["selected"]:
+                    return "按↑ to select"
+                return None
+
+            try:
+                text = pt_prompt(
+                    prompt_obj,
+                    default=default_text,
+                    multiline=True,
+                    key_bindings=kb,
+                    history=history,
+                    wrap_lines=True,
+                    placeholder=placeholder_text,
+                    bottom_toolbar=toolbar_func,
+                    rprompt=get_rprompt,
+                )
+            except KeyboardInterrupt:
+                return None
+            if text == cancel_token:
+                return None
+
+            text = sanitize_terminal_paste(text)
+
+            # 如果有选中的图片，在文本末尾添加图片标记
+            if image_attachment["selected"] and image_attachment["path"]:
+                text = text + f" [Image: {image_attachment['path']}]"
+
+            return text
+
+        prompt = readline_safe_prompt(prompt_text())
+        cont_prompt = readline_safe_prompt(colored("...> ", Color.BOLD))
+
+        # 确保提示符显示
+        sys.stdout.flush()
+
+        if use_box:
+            print(colored("输入框模式：输入多行，单独一行输入 . 结束；空内容取消。", Color.YELLOW))
+            lines: list[str] = []
+            while True:
+                try:
+                    l = input(cont_prompt)
+                except KeyboardInterrupt:
+                    return None
+                if l == '.':
+                    break
+                lines.append(l)
+            text = "\n".join(lines)
+            text = sanitize_terminal_paste(text)
+            return text if text.strip() else None
+
+        try:
+            line = input(prompt)
+        except KeyboardInterrupt:
+            return None
+        lines = []
+        while True:
+            if line.endswith('\\'):
+                lines.append(line[:-1])
+                try:
+                    line = input(cont_prompt)
+                except KeyboardInterrupt:
+                    return None
+                continue
+            lines.append(line)
+            break
+        return sanitize_terminal_paste("\n".join(lines))
+
+    def maybe_confirm_box(text: str) -> str | None:
+        show = (input_mode == 'box') or ('\n' in text) or (len(text) >= 400)
+        if not show:
+            return text
+
+        while True:
+            print_box("内容", text)
+            ans = input("发送？[Enter]=发送, e=编辑, c=取消 > ").strip().lower()
+            if ans in {'', 'y', 'yes'}:
+                return text
+            if ans in {'c', 'cancel', 'n', 'no'}:
+                return None
+            if ans in {'e', 'edit'}:
+                edited = read_user_message(force_box=True, default_text=text)
+                if edited is None:
+                    return None
+                text = edited
+                continue
+
+    while True:
+        try:
+            user_input_raw = read_user_message()
+            if user_input_raw is None:
+                continue
+
+            # 提取图片附件 [Image: /path/to/image.png]
+            import re
+            image_match = re.search(r'\[Image:\s*(.+?)\]', user_input_raw)
+            image_path = None
+            if image_match:
+                image_path = image_match.group(1).strip()
+                user_input_raw = re.sub(r'\s*\[Image:\s*.+?\]', '', user_input_raw)
+
+            user_input = user_input_raw.strip()
+
+            if user_input in [':paste', '/paste']:
+                pasted = read_user_message(force_box=True)
+                if pasted is None:
+                    continue
+                user_input = pasted.strip()
+
+
+            if not user_input:
+                continue
+
+            # 处理命令（以 : 或 / 开头）
+            # 为了区分命令和文件路径，检查是否是有效命令
+            is_command = False
+            cmd_prefix = None
+
+            if user_input.startswith(':'):
+                is_command = True
+                cmd_prefix = ':'
+            elif user_input.startswith('/'):
+                # 检查是否是已知命令（而非文件路径）
+                first_word = user_input[1:].split()[0].lower() if len(user_input) > 1 else ''
+                known_commands = ['quit', 'q', 'exit', 'help', 'h', 'clear', 'c', 'history', 'read', 'write', 'img', 'sessions', 'save', 'load', 'model', 'backend', 'stream', 'spinner', 'mode', 'prefs', 'status', 'paste']
+                if first_word in known_commands:
+                    is_command = True
+                    cmd_prefix = '/'
+
+            if is_command:
+                cmd_parts = user_input[1:].split(maxsplit=1)
+                cmd = cmd_parts[0].lower()
+                cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else None
+
+                if cmd in ['quit', 'q', 'exit']:
+                    auto_save_history(messages, model)
+                    print(colored("  bye.", Color.DIM))
+                    break
+                elif cmd in ['help', 'h']:
+                    print_help()
+                elif cmd in ['clear', 'c']:
+                    if messages:
+                        msg_count = len(messages)
+                        round_count = msg_count // 2
+                        print(colored(f"🗑️  已清空 {msg_count} 条消息 ({round_count} 轮对话)", Color.YELLOW))
+                        print(colored("   上下文已重置，开始新的对话", Color.YELLOW))
+                        messages = []
+                    else:
+                        print(colored("对话历史本来就是空的", Color.YELLOW))
+                elif cmd == 'history':
+                    if not messages:
+                        print(colored("对话历史为空", Color.YELLOW))
+                    else:
+                        for i, msg in enumerate(messages):
+                            role = "You" if msg["role"] == "user" else "AI"
+                            content = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+                            print(f"  [{i+1}] {role}: {content}")
+                elif cmd == 'model':
+                    if cmd_arg:
+                        model = resolve_model(cmd_arg)
+                        print(colored(f"→ {model}", Color.GREEN))
+                    else:
+                        print(f"当前模型: {model}")
+                        print(f"可用模型: flash, pro, pro3")
+                elif cmd == 'backend':
+                    if cmd_arg and cmd_arg in BACKENDS:
+                        backend_name = cmd_arg
+                        backend_config = BACKENDS[backend_name]
+                        print(colored(f"→ {backend_name}", Color.GREEN))
+                    else:
+                        print(f"当前后端: {backend_config['name']}")
+                        print(f"可用后端: {', '.join(BACKENDS.keys())}")
+                elif cmd == 'status':
+                    turns = len(messages) // 2
+                    stream_status = "on" if use_stream else "off"
+                    spinner_status = "on" if show_spinner else "off"
+                    tools_status = ', '.join([t['name'] for t in enabled_tools]) if enabled_tools else "-"
+                    prefs_status = "on" if preferences else "off"
+                    print(colored(f"  {model}  ·  {turns} turns  ·  stream {stream_status}  ·  spinner {spinner_status}  ·  prefs {prefs_status}", Color.DIM))
+                elif cmd in {'prefs', 'preferences'}:
+                    # 管理偏好文件
+                    prefs_path = get_preferences_path()
+                    if cmd_arg == 'edit':
+                        # 用默认编辑器打开
+                        editor = os.environ.get('EDITOR', 'vim')
+                        os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
+                        if not os.path.exists(prefs_path):
+                            # 创建模板
+                            with open(prefs_path, 'w', encoding='utf-8') as f:
+                                f.write("# GCHAT 偏好设置\n\n")
+                                f.write("# 这个文件的内容会作为系统提示发送给 AI\n")
+                                f.write("# 你可以在这里设置：\n")
+                                f.write("# - 偏好的回复风格\n")
+                                f.write("# - 常用的上下文信息\n")
+                                f.write("# - 项目相关的说明\n\n")
+                        os.system(f'{editor} "{prefs_path}"')
+                        # 重新加载
+                        preferences = load_preferences()
+                        if preferences:
+                            # 更新 messages 中的 system 消息
+                            messages = [m for m in messages if m.get("role") != "system" or "[对话历史摘要]" in m.get("content", "")]
+                            messages.insert(0, {"role": "system", "content": preferences})
+                            print(colored("→ preferences reloaded", Color.GREEN))
+                    elif cmd_arg == 'show':
+                        if os.path.exists(prefs_path):
+                            with open(prefs_path, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                            print(colored("─" * 40, Color.DIM))
+                            print(content)
+                            print(colored("─" * 40, Color.DIM))
+                        else:
+                            print(colored("  no preferences file", Color.DIM))
+                    elif cmd_arg == 'path':
+                        print(colored(f"  {prefs_path}", Color.DIM))
+                    else:
+                        prefs_exists = os.path.exists(prefs_path)
+                        print(colored(f"→ prefs: {'on' if prefs_exists else 'off'}", Color.GREEN if prefs_exists else Color.DIM))
+                        print(colored(f"  path: {prefs_path}", Color.DIM))
+                        print(colored("  /prefs edit  - 编辑偏好文件", Color.DIM))
+                        print(colored("  /prefs show  - 显示当前内容", Color.DIM))
+                elif cmd == 'sessions':
+                    # 列出所有会话
+                    sessions = list_sessions()
+                    if sessions:
+                        print(colored("保存的会话:", Color.GREEN))
+                        for i, s in enumerate(sessions[:10]):  # 最多显示10个
+                            ts = s["timestamp"]
+                            if ts:
+                                ts = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}"
+                            print(f"  [{i+1}] {ts} | {s['model']} | {s['msg_count']}条 | {s['preview']}")
+                        if len(sessions) > 10:
+                            print(colored(f"  ... 还有 {len(sessions) - 10} 个会话", Color.DIM))
+                        print(colored("\n使用 /load <编号> 加载会话", Color.YELLOW))
+                elif cmd == 'read':
+                    # 读取文件
+                    if not cmd_arg:
+                        print(colored("用法: /read <文件路径>", Color.YELLOW))
+                        continue
+                    file_result, error = read_file_content(cmd_arg)
+                    if error:
+                        print(colored(error, Color.RED))
+                        continue
+                    if file_result["type"] == "image":
+                        # 图片文件，转到图片处理
+                        print(colored(f"📷 检测到图片: {file_result['path']}", Color.CYAN))
+                        user_message = {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "请描述这张图片。"},
+                                {"type": "image_file", "path": file_result["path"]}
+                            ],
+                        }
+                    else:
+                        # 文本文件
+                        content = file_result["content"]
+                        file_path = file_result["path"]
+                        line_count = content.count('\n') + 1
+                        print(colored(f"📄 已读取: {file_path} ({line_count} 行)", Color.CYAN))
+                        user_message = {
+                            "role": "user",
+                            "content": f"请分析以下文件内容:\n\n文件: {file_path}\n\n```\n{content}\n```"
+                        }
+                    messages.append(user_message)
+                    print()  # AI response follows
+                    if use_stream:
+                        response = chat_request_with_fallback_stream(messages, model, backend_config, show_spinner=show_spinner)
+                    else:
+                        response = chat_request_with_fallback(messages, model, backend_config)
+                        print(response)
+                    print()
+                    messages.append({"role": "assistant", "content": response})
+                elif cmd == 'write':
+                    # 写入文件
+                    if not cmd_arg:
+                        print(colored("用法: /write <文件路径>", Color.YELLOW))
+                        continue
+                    if not messages:
+                        print(colored("没有可保存的内容", Color.YELLOW))
+                        continue
+                    # 获取最后一条AI回复
+                    last_response = None
+                    for msg in reversed(messages):
+                        if msg.get("role") == "assistant":
+                            last_response = msg.get("content", "")
+                            break
+                    if not last_response:
+                        print(colored("没有AI回复可保存", Color.YELLOW))
+                        continue
+                    success, result = write_to_file(cmd_arg, last_response)
+                    if success:
+                        print(colored(f"✅ 已保存到: {result}", Color.GREEN))
+                    else:
+                        print(colored(f"❌ 保存失败: {result}", Color.RED))
+                elif cmd == 'stream':
+                    # 切换流式输出
+                    use_stream = not use_stream
+                    print(colored(f"→ stream {'on' if use_stream else 'off'}", Color.GREEN))
+                elif cmd == 'spinner':
+                    # 切换 spinner 动画
+                    show_spinner = not show_spinner
+                    print(colored(f"→ spinner {'on' if show_spinner else 'off'}", Color.GREEN))
+                elif cmd == 'tools':
+                    if not cmd_arg:
+                        # 列出当前启用的工具
+                        if enabled_tools:
+                            names = [t['name'] for t in enabled_tools]
+                            print(colored(f"→ tools: {', '.join(names)}", Color.GREEN))
+                        else:
+                            print(colored("→ tools: none", Color.DIM))
+                            print(colored(f"  available: {', '.join(BUILTIN_TOOLS.keys())}", Color.DIM))
+                    else:
+                        parts = cmd_arg.split(maxsplit=1)
+                        subcmd = parts[0].lower()
+                        subarg = parts[1] if len(parts) > 1 else None
+
+                        if subcmd == 'list':
+                            for name, tool in BUILTIN_TOOLS.items():
+                                status = "+" if any(t['name'] == tool['name'] for t in enabled_tools) else " "
+                                print(colored(f"  {status} {name}", Color.GREEN if status == "+" else Color.DIM))
+                        elif subcmd == 'add':
+                            if subarg and subarg in BUILTIN_TOOLS:
+                                tool = BUILTIN_TOOLS[subarg]
+                                if not any(t['name'] == tool['name'] for t in enabled_tools):
+                                    enabled_tools.append(tool)
+                                    print(colored(f"+ {tool['name']}", Color.GREEN))
+                                else:
+                                    print(colored(f"  {subarg} already enabled", Color.DIM))
+                            else:
+                                print(colored(f"  unknown: {subarg}", Color.RED))
+                        elif subcmd == 'remove':
+                            if subarg:
+                                tool = BUILTIN_TOOLS.get(subarg)
+                                if tool:
+                                    enabled_tools = [t for t in enabled_tools if t['name'] != tool['name']]
+                                    print(colored(f"- {tool['name']}", Color.YELLOW))
+                                else:
+                                    print(colored(f"  unknown: {subarg}", Color.RED))
+                            else:
+                                print(colored("  usage: /tools remove <name>", Color.DIM))
+                        elif subcmd == 'clear':
+                            enabled_tools = []
+                            print(colored("→ tools cleared", Color.YELLOW))
+                        else:
+                            print(colored("  usage: /tools [list|add|remove|clear]", Color.DIM))
+                elif cmd == 'call':
+                    # 强制使用官方API进行Function Calling
+                    if not cmd_arg:
+                        print("用法: /call <提示词>")
+                        continue
+
+                    if not enabled_tools:
+                        print(colored("⚠️  没有启用任何工具，请先使用 /tools add <name> 添加工具", Color.YELLOW))
+                        continue
+
+                    print(colored(f"🔧 使用官方API进行Function Calling...", Color.CYAN))
+                    messages.append({"role": "user", "content": cmd_arg})
+
+                    result, error = official_api_request(messages, model, enabled_tools)
+                    if error:
+                        print(colored(error, Color.RED))
+                        messages.pop()  # 移除失败的消息
+                        continue
+
+                    if result["type"] == "function_call":
+                        fc_name = result["name"]
+                        fc_args = result["args"]
+                        print(colored(f"📞 函数调用: {fc_name}({json.dumps(fc_args, ensure_ascii=False)})", Color.YELLOW))
+
+                        # 执行函数
+                        fc_result = execute_function(fc_name, fc_args)
+                        print(colored(f"📤 函数结果: {json.dumps(fc_result, ensure_ascii=False)}", Color.GREEN))
+
+                        # 记录到历史
+                        messages.append({"role": "assistant", "content": f"[调用函数 {fc_name}]\n参数: {json.dumps(fc_args, ensure_ascii=False)}\n结果: {json.dumps(fc_result, ensure_ascii=False)}"})
+                    else:
+                        print()  # AI response follows
+                        print(result["content"])
+                        messages.append({"role": "assistant", "content": result["content"]})
+                    print()
+                elif cmd == 'save':
+                    if cmd_arg:
+                        try:
+                            with open(cmd_arg, 'w', encoding='utf-8') as f:
+                                json.dump({"model": model, "messages": messages}, f, ensure_ascii=False, indent=2)
+                            print(colored(f"对话已保存到: {cmd_arg}", Color.GREEN))
+                        except Exception as e:
+                            print(colored(f"保存失败: {e}", Color.RED))
+                    else:
+                        print("用法: /save <文件名>")
+                elif cmd == 'load':
+                    if cmd_arg:
+                        try:
+                            with open(cmd_arg, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                                messages = data.get("messages", [])
+                                model = data.get("model", model)
+                            print(colored(f"对话已加载，共 {len(messages)} 条消息", Color.GREEN))
+                        except Exception as e:
+                            print(colored(f"加载失败: {e}", Color.RED))
+                    else:
+                        print("用法: /load <文件名>")
+                elif cmd == 'mode':
+                    if not cmd_arg:
+                        input_mode = 'box' if input_mode == 'normal' else 'normal'
+                    else:
+                        arg = cmd_arg.strip().lower()
+                        if arg in {'normal', 'n'}:
+                            input_mode = 'normal'
+                        elif arg in {'box', 'b'}:
+                            input_mode = 'box'
+                        else:
+                            print(colored("用法: /mode [normal|box]", Color.YELLOW))
+                            continue
+                    print(colored(f"→ {input_mode}", Color.GREEN))
+                elif cmd in {'img', 'image'}:
+                    try:
+                        parts = shlex.split(user_input, posix=True)
+                    except ValueError as e:
+                        print(colored(f"参数解析失败: {e}", Color.RED))
+                        continue
+
+                    args = parts[1:]
+                    if not args:
+                        print(colored("用法: /img <图片路径...> [描述文本]", Color.YELLOW))
+                        continue
+
+                    # 使用贪婪合并逻辑处理带空格的图片路径
+                    image_paths: list[Path] = []
+                    text_parts: list[str] = []
+                    i = 0
+
+                    while i < len(args):
+                        tok = args[i]
+
+                        # 如果 token 以 / 或 ~ 开头，可能是路径的开始
+                        if tok.startswith('/') or tok.startswith('~'):
+                            # 贪婪地尝试合并后续 tokens，找到最长的有效图片路径
+                            found_image = None
+                            merged_count = 0
+
+                            for j in range(i, len(args)):
+                                candidate = ' '.join(args[i:j+1])
+                                p = Path(candidate).expanduser()
+
+                                if is_image_file(p):
+                                    found_image = p
+                                    merged_count = j - i + 1
+
+                            if found_image:
+                                image_paths.append(found_image)
+                                i += merged_count
+                                continue
+
+                        # 不是图片路径，加入文本部分
+                        text_parts.append(tok)
+                        i += 1
+
+                    if not image_paths:
+                        print(colored("未检测到有效图片文件（支持 png/jpg/jpeg/webp/gif 等）", Color.YELLOW))
+                        continue
+
+                    user_text = " ".join(text_parts).strip() or "请描述这张图片。"
+                    confirmed_text = maybe_confirm_box(user_text)
+                    if confirmed_text is None:
+                        continue
+
+                    user_message = {
+                        "role": "user",
+                        "content": [{"type": "text", "text": confirmed_text}] + [
+                            {"type": "image_file", "path": str(p)} for p in image_paths
+                        ],
+                    }
+                    messages.append(user_message)
+
+                    print()  # AI response follows
+                    response = chat_request_with_fallback(messages, model, backend_config)
+                    print(response)
+                    print()
+                    messages.append({"role": "assistant", "content": response})
+                else:
+                    print(colored(f"未知命令: :{cmd}，输入 :help 查看帮助", Color.RED))
+                continue
+
+            # 图片：支持直接拖拽图片路径到输入框，或通过 [Image: ...] 标记
+            cleaned_text, image_paths = extract_local_image_paths(user_input)
+
+            # 如果有通过方向键选择的图片
+            if image_path:
+                image_paths.insert(0, Path(image_path))
+
+            if image_paths:
+                user_text = cleaned_text or "请描述这张图片。"
+                confirmed_text = maybe_confirm_box(user_text)
+                if confirmed_text is None:
+                    continue
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": confirmed_text}] + [
+                        {"type": "image_file", "path": str(p)} for p in image_paths
+                    ],
+                })
+            else:
+                confirmed_text = maybe_confirm_box(user_input)
+                if confirmed_text is None:
+                    continue
+                messages.append({"role": "user", "content": confirmed_text})
+
+            # 发送请求 - 混合路由逻辑
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+            # 上下文压缩 - 当消息过多时自动摘要
+            messages, compressed = compress_context(messages, backend_config, model)
+            if compressed:
+                print(colored("○ context compressed", Color.DIM))
+
+            if enabled_tools and backend_config.get("supports_tools"):
+                # 有工具且后端支持时，使用工具调用
+                if backend_name == "google":
+                    # google 后端使用 OpenAI 格式
+                    result, error = openai_tools_request(messages, model, enabled_tools, backend_config)
+                else:
+                    # official 后端使用 Gemini 原生格式
+                    result, error = official_api_request(messages, model, enabled_tools)
+
+                if error:
+                    print(colored(error, Color.RED))
+                    messages.pop()  # 移除失败的消息
+                    continue
+
+                if result["type"] == "function_call":
+                    fc_name = result["name"]
+                    fc_args = result["args"]
+                    print(colored(f"📞 函数调用: {fc_name}({json.dumps(fc_args, ensure_ascii=False)})", Color.YELLOW))
+
+                    # 执行函数
+                    fc_result = execute_function(fc_name, fc_args)
+                    print(colored(f"📤 函数结果: {json.dumps(fc_result, ensure_ascii=False)}", Color.GREEN))
+
+                    # 记录到历史
+                    response = f"[调用函数 {fc_name}]\n参数: {json.dumps(fc_args, ensure_ascii=False)}\n结果: {json.dumps(fc_result, ensure_ascii=False)}"
+                else:
+                    response = result["content"]
+                    print(response)
+            else:
+                # 无工具或后端不支持时使用普通请求
+                if use_stream:
+                    response = chat_request_with_fallback_stream(messages, model, backend_config, show_spinner=show_spinner)
+                else:
+                    response = chat_request_with_fallback(messages, model, backend_config)
+                    print(response)
+
+            print()
+
+            # 添加AI回复到历史
+            messages.append({"role": "assistant", "content": response})
+
+        except KeyboardInterrupt:
+            # 实时中断：保存上下文
+            print("\n" + colored("💾 已保存上下文，按 Enter 继续或 /q 退出", Color.YELLOW))
+            auto_save_history(messages, model)
+        except EOFError:
+            print()
+            auto_save_history(messages, model)
+            print(colored("  bye.", Color.DIM))
+            break
+
+
+def upload_to_r2(image_data: bytes, filename: str) -> str:
+    """上传图片到 Cloudflare R2，返回公开URL"""
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError:
+        return "[错误] 需要安装 boto3: pip install boto3"
+
+    s3 = boto3.client(
+        's3',
+        endpoint_url=R2_CONFIG["endpoint"],
+        aws_access_key_id=R2_CONFIG["access_key_id"],
+        aws_secret_access_key=R2_CONFIG["secret_access_key"],
+        config=Config(signature_version='s3v4'),
+        region_name='auto'
+    )
+
+    # 路径格式: nexusai/img/turing_YYYYMMDD_HHMMSS.png
+    key = f"nexusai/img/{filename}"
+
+    try:
+        s3.put_object(
+            Bucket=R2_CONFIG["bucket"],
+            Key=key,
+            Body=image_data,
+            ContentType='image/png'
+        )
+        return f"{R2_CONFIG['public_url']}/{key}"
+    except Exception as e:
+        return f"[R2上传失败] {e}"
+
+
+def _generate_image_zyai(prompt: str, model: str) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 ZYAI (Gemini Native API) 生成图片"""
+    import urllib.request
+    import urllib.error
+
+    url = ZYAI_IMAGE_CONFIG["url"].replace("{model}", model)
+    headers = {
+        "Authorization": f"Bearer {ZYAI_IMAGE_CONFIG['key']}",
+        "Content-Type": "application/json"
+    }
+    # Gemini Native API 格式
+    data = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # Gemini Native API 响应格式
+            # {"candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "..."}}]}}]}
+            if "candidates" in result:
+                for candidate in result["candidates"]:
+                    parts = candidate.get("content", {}).get("parts", [])
+                    for part in parts:
+                        inline_data = part.get("inlineData", {})
+                        if inline_data.get("data"):
+                            return base64.b64decode(inline_data["data"]), ""
+
+            return None, f"[ZYAI响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[ZYAI HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[ZYAI错误] {e}"
+
+
+def _generate_image_nexusai(prompt: str, model: str) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 NexusAI (OpenAI格式) 生成图片"""
+    import urllib.request
+    import urllib.error
+
+    url = NEXUSAI_IMAGE_CONFIG["url"]
+    headers = {
+        "Authorization": f"Bearer {NEXUSAI_IMAGE_CONFIG['key']}",
+        "Content-Type": "application/json"
+    }
+    data = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "response_format": "b64_json"
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # 格式1: {"images": ["data:image/png;base64,..."]}
+            if "images" in result and len(result["images"]) > 0:
+                data_url = result["images"][0]
+                if data_url.startswith("data:"):
+                    b64_data = data_url.split(",", 1)[1] if "," in data_url else data_url
+                    return base64.b64decode(b64_data), ""
+
+            # 格式2: {"data": [{"b64_json": "..."}]}
+            if "data" in result and len(result["data"]) > 0:
+                b64_data = result["data"][0].get("b64_json")
+                if b64_data:
+                    return base64.b64decode(b64_data), ""
+
+            return None, f"[NexusAI响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[NexusAI HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[NexusAI错误] {e}"
+
+
+def _generate_image_gptload(prompt: str, model: str) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 GPT-Load (Cookie模式，无额度限制) 生成图片"""
+    import urllib.request
+    import urllib.error
+
+    url = GPTLOAD_IMAGE_CONFIG["url"]
+    headers = {
+        "Authorization": f"Bearer {GPTLOAD_IMAGE_CONFIG['key']}",
+        "Content-Type": "application/json"
+    }
+    data = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "response_format": "b64_json"
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # 格式1: {"images": ["data:image/png;base64,..."]}
+            if "images" in result and len(result["images"]) > 0:
+                data_url = result["images"][0]
+                if data_url.startswith("data:"):
+                    b64_data = data_url.split(",", 1)[1] if "," in data_url else data_url
+                    return base64.b64decode(b64_data), ""
+
+            # 格式2: {"data": [{"b64_json": "..."}]}
+            if "data" in result and len(result["data"]) > 0:
+                b64_data = result["data"][0].get("b64_json")
+                if b64_data:
+                    return base64.b64decode(b64_data), ""
+
+            return None, f"[GPT-Load响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[GPT-Load HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[GPT-Load错误] {e}"
+
+
+def _generate_image_yunwu(prompt: str, model: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 YUNWU Chat API 生成图片 (chat completions with image model)
+
+    Args:
+        prompt: 图片生成提示词
+        model: 图片生成模型
+        ref_image_b64: 参考图片的base64编码 (用于图生图)
+    """
+    import urllib.request
+    import urllib.error
+
+    url = YUNWU_IMAGE_CONFIG["url"]
+    headers = {
+        "Authorization": f"Bearer {YUNWU_IMAGE_CONFIG['key']}",
+        "Content-Type": "application/json"
+    }
+
+    # 构建消息内容
+    if ref_image_b64:
+        # 图生图模式：包含参考图片
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_image_b64}"}}
+        ]
+    else:
+        content = prompt
+
+    # 使用 chat completions 格式，模型会返回图片
+    data = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 4096
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # Chat completions 格式响应
+            if "choices" in result and len(result["choices"]) > 0:
+                msg_content = result["choices"][0].get("message", {}).get("content", "")
+                # 检查是否包含 base64 图片数据
+                if "data:image" in str(msg_content):
+                    # 提取 base64 部分
+                    import re
+                    content_str = str(msg_content) if not isinstance(msg_content, str) else msg_content
+                    match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', content_str)
+                    if match:
+                        return base64.b64decode(match.group(1)), ""
+
+            return None, f"[YUNWU响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[YUNWU HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[YUNWU错误] {e}"
+
+
+def _generate_image_google_api(prompt: str, model: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 Google API (最终降级，Cookie模式无需Key)
+
+    Args:
+        prompt: 图片生成提示词
+        model: 图片生成模型
+        ref_image_b64: 参考图片的base64编码 (用于图生图)
+    """
+    import urllib.request
+    import urllib.error
+
+    url = GOOGLE_API_IMAGE_CONFIG["url"]
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    # 构建消息内容
+    if ref_image_b64:
+        # 图生图模式：包含参考图片
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_image_b64}"}}
+        ]
+    else:
+        content = prompt
+
+    # 使用 chat completions 格式
+    data = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 4096
+    }).encode('utf-8')
+
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            # Chat completions 格式响应
+            if "choices" in result and len(result["choices"]) > 0:
+                msg_content = result["choices"][0].get("message", {}).get("content", "")
+                # 检查是否包含 base64 图片数据
+                if "data:image" in str(msg_content):
+                    import re
+                    content_str = str(msg_content) if not isinstance(msg_content, str) else msg_content
+                    match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', content_str)
+                    if match:
+                        return base64.b64decode(match.group(1)), ""
+
+            return None, f"[Google-API响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"[Google-API HTTP {e.code}] {error_body[:200]}"
+    except Exception as e:
+        return None, f"[Google-API错误] {e}"
+
+
+def generate_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, ref_image_b64: str = None) -> tuple[bytes, str, str] | tuple[None, str, str]:
+    """生成图片 (多API降级：GPT-Load -> YUNWU -> ZYAI -> NexusAI -> Google-API)
+
+    Args:
+        prompt: 图片生成提示词
+        model: 图片生成模型
+        ref_image_b64: 参考图片的base64编码 (用于图生图)
+
+    返回: (图片数据, 生成源, 错误信息)
+    """
+    errors = []
+
+    # 如果有参考图片，使用支持图生图的API降级链
+    if ref_image_b64:
+        # 1. 优先使用 YUNWU (有余额，chat completions支持图生图)
+        image_data, error = _generate_image_yunwu(prompt, model, ref_image_b64)
+        if image_data:
+            return image_data, "YUNWU", ""
+        errors.append(f"YUNWU: {error}")
+
+        # 2. 降级到 Google-API (chat completions支持图生图)
+        image_data, error = _generate_image_google_api(prompt, model, ref_image_b64)
+        if image_data:
+            return image_data, "Google-API", ""
+        errors.append(f"Google-API: {error}")
+
+        # 3. 最终降级：Google 专用图片编辑端点 (/v1/images/edit)
+        image_data, error = _generate_image_google_dedicated(prompt, ref_image_b64)
+        if image_data:
+            return image_data, "Google-Edit", ""
+        errors.append(f"Google-Edit: {error}")
+
+        return None, "", f"图生图失败: {' | '.join(errors)}"
+
+    # 1. 先尝试 GPT-Load (Cookie模式，无额度限制)
+    image_data, error = _generate_image_gptload(prompt, model)
+    if image_data:
+        return image_data, "GPT-Load", ""
+    errors.append(error)
+
+    # 2. 尝试 YUNWU
+    image_data, error = _generate_image_yunwu(prompt, model)
+    if image_data:
+        return image_data, "YUNWU", ""
+    errors.append(error)
+
+    # 3. 尝试 ZYAI
+    image_data, error = _generate_image_zyai(prompt, model)
+    if image_data:
+        return image_data, "ZYAI", ""
+    errors.append(error)
+
+    # 4. 尝试 NexusAI
+    image_data, error = _generate_image_nexusai(prompt, model)
+    if image_data:
+        return image_data, "NexusAI", ""
+    errors.append(error)
+
+    # 5. 最终降级：Google 专用图片生成端点 (/v1/generate-images)
+    image_data, error = _generate_image_google_dedicated(prompt)
+    if image_data:
+        return image_data, "Google-Gen", ""
+    errors.append(f"Google-Gen: {error}")
+
+    # 都失败了
+    return None, "", f"所有API都失败: {' | '.join(errors)}"
+
+
+# ==================== SQLite 存储模块 ====================
+
+def _get_db_path() -> Path:
+    """获取数据库路径"""
+    db_dir = Path.home() / ".turing"
+    db_dir.mkdir(exist_ok=True)
+    return db_dir / "turing.db"
+
+
+def _init_db():
+    """初始化SQLite数据库和表结构"""
+    db_path = _get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # 图片生成历史表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS image_generations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            url TEXT,
+            model TEXT,
+            source TEXT,
+            ref_image TEXT,
+            gen_time REAL,
+            upload_time REAL
+        )
+    ''')
+
+    # 图片描述历史表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS image_descriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            image_path TEXT NOT NULL,
+            json_result TEXT,
+            model TEXT,
+            source TEXT
+        )
+    ''')
+
+    # 创建索引加速查询
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_gen_timestamp ON image_generations(timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_desc_timestamp ON image_descriptions(timestamp)')
+
+    conn.commit()
+    conn.close()
+
+
+def _save_image_history(prompt: str, url: str, model: str, source: str, ref_image: str = None,
+                        gen_time: float = None, upload_time: float = None):
+    """保存图片生成历史到SQLite"""
+    from datetime import datetime
+
+    _init_db()
+    conn = sqlite3.connect(_get_db_path())
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT INTO image_generations (timestamp, prompt, url, model, source, ref_image, gen_time, upload_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (datetime.now().isoformat(), prompt, url, model, source, ref_image, gen_time, upload_time))
+
+    conn.commit()
+    conn.close()
+
+
+def _save_image_description(image_path: str, json_result: str, model: str, source: str):
+    """保存图片描述到SQLite"""
+    from datetime import datetime
+
+    _init_db()
+    conn = sqlite3.connect(_get_db_path())
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT INTO image_descriptions (timestamp, image_path, json_result, model, source)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (datetime.now().isoformat(), image_path, json_result, model, source))
+
+    conn.commit()
+    conn.close()
+
+
+def query_image_history(limit: int = 20, search: str = None, desc_only: bool = False) -> str:
+    """查询图片历史记录
+
+    Args:
+        limit: 返回记录数量
+        search: 搜索关键词 (匹配prompt或image_path)
+        desc_only: 仅显示描述历史
+
+    Returns:
+        格式化的历史记录字符串
+    """
+    _init_db()
+    conn = sqlite3.connect(_get_db_path())
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    results = []
+
+    if not desc_only:
+        # 查询图片生成历史
+        if search:
+            cursor.execute('''
+                SELECT * FROM image_generations
+                WHERE prompt LIKE ?
+                ORDER BY timestamp DESC LIMIT ?
+            ''', (f'%{search}%', limit))
+        else:
+            cursor.execute('''
+                SELECT * FROM image_generations
+                ORDER BY timestamp DESC LIMIT ?
+            ''', (limit,))
+
+        gen_rows = cursor.fetchall()
+        for row in gen_rows:
+            time_str = row['timestamp'][:19].replace('T', ' ')
+            gen_info = f" ({row['gen_time']:.1f}s)" if row['gen_time'] else ""
+            ref_info = f" [垫图]" if row['ref_image'] else ""
+            results.append(f"[生成] {time_str} | {row['source']}{gen_info}{ref_info}")
+            results.append(f"       {row['prompt'][:60]}{'...' if len(row['prompt']) > 60 else ''}")
+            results.append(f"       {row['url']}")
+            results.append("")
+
+    # 查询图片描述历史
+    if search:
+        cursor.execute('''
+            SELECT * FROM image_descriptions
+            WHERE image_path LIKE ? OR json_result LIKE ?
+            ORDER BY timestamp DESC LIMIT ?
+        ''', (f'%{search}%', f'%{search}%', limit))
+    else:
+        cursor.execute('''
+            SELECT * FROM image_descriptions
+            ORDER BY timestamp DESC LIMIT ?
+        ''', (limit,))
+
+    desc_rows = cursor.fetchall()
+    for row in desc_rows:
+        time_str = row['timestamp'][:19].replace('T', ' ')
+        results.append(f"[描述] {time_str} | {row['source']} | {row['model']}")
+        results.append(f"       {row['image_path']}")
+        # 显示JSON摘要
+        try:
+            json_obj = json.loads(row['json_result'])
+            if 'subjects' in json_obj:
+                subjects = json_obj.get('subjects', [])
+                if subjects and isinstance(subjects, list):
+                    first_subject = subjects[0] if subjects else {}
+                    appearance = first_subject.get('appearance', '')[:40] if isinstance(first_subject, dict) else ''
+                    results.append(f"       主体: {appearance}...")
+        except:
+            results.append(f"       {row['json_result'][:60]}...")
+        results.append("")
+
+    conn.close()
+
+    if not results:
+        return "暂无历史记录"
+
+    return "\n".join(results)
+
+
+def generate_and_upload_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, verbose: bool = True, ref_image: str = None) -> str:
+    """生成图片并上传到 R2，返回公开URL或错误信息
+
+    Args:
+        prompt: 图片生成提示词
+        model: 图片生成模型
+        verbose: 是否显示详细信息
+        ref_image: 参考图片路径 (垫图，用于图生图)
+    """
+    from datetime import datetime
+    import hashlib
+
+    start_time = time.time()
+
+    # 如果有参考图片，读取并编码
+    ref_image_data = None
+    if ref_image:
+        ref_path = Path(ref_image).expanduser()
+        if ref_path.exists():
+            with open(ref_path, "rb") as f:
+                ref_image_data = base64.b64encode(f.read()).decode()
+        else:
+            return f"[错误] 参考图片不存在: {ref_image}"
+
+    # 生成图片
+    image_data, source, error = generate_image(prompt, model, ref_image_data)
+    if error:
+        return error
+    if not image_data:
+        return "[错误] 图片生成失败，无数据返回"
+
+    gen_time = time.time() - start_time
+
+    # 生成语义化文件名: turing_YYYYMMDD_HHMMSS_<hash>.png
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:6]
+    filename = f"turing_{timestamp}_{prompt_hash}.png"
+
+    # 上传到 R2
+    upload_start = time.time()
+    url = upload_to_r2(image_data, filename)
+    upload_time = time.time() - upload_start
+    total_time = time.time() - start_time
+
+    # 保存历史记录
+    if url.startswith("http"):
+        _save_image_history(prompt, url, model, source, ref_image, gen_time, upload_time)
+
+    # 返回结果（包含元信息）
+    if url.startswith("http"):
+        if verbose:
+            ref_info = f" [垫图: {ref_image}]" if ref_image else ""
+            return f"{url}\n[{source}] {gen_time:.1f}s生成 + {upload_time:.1f}s上传 = {total_time:.1f}s{ref_info}"
+        return url
+    return url  # 错误信息
+
+
+# JSON描述提示词模板
+JSON_DESCRIBE_PROMPT = """请使用JSON格式详细描述这张照片，包括：
+- 图片尺寸 (width, height)
+- 主体对象 (subjects)
+  - 位置 (position)
+  - 外观 (appearance)
+  - 服装 (clothing)
+  - 表情 (expression)
+- 背景环境 (background)
+- 光线条件 (lighting)
+- 色彩风格 (color_style)
+- 构图方式 (composition)
+
+输出严格有效的JSON格式。"""
+
+
+def _describe_image_api(image_b64: str, model: str, api_url: str, api_key: str = None) -> tuple[str, str]:
+    """内部函数：调用API获取图片描述
+
+    Returns:
+        (json_content, error_message) - 成功返回(json, ""), 失败返回("", error)
+    """
+    import urllib.request
+    import urllib.error
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    content = [
+        {"type": "text", "text": JSON_DESCRIBE_PROMPT},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}
+    ]
+
+    data = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 4096
+    }).encode('utf-8')
+
+    req = urllib.request.Request(api_url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            if "choices" in result and len(result["choices"]) > 0:
+                msg_content = result["choices"][0].get("message", {}).get("content", "")
+                if isinstance(msg_content, str):
+                    import re
+                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', msg_content)
+                    if json_match:
+                        return json_match.group(1).strip(), ""
+                    json_match = re.search(r'\{[\s\S]*\}', msg_content)
+                    if json_match:
+                        return json_match.group(0), ""
+                    return msg_content, ""
+                return str(msg_content), ""
+
+            return "", f"响应异常: {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return "", f"HTTP {e.code}: {error_body[:100]}"
+    except Exception as e:
+        return "", str(e)
+
+
+def describe_image_json(image_path: str, model: str = "gemini-3-flash-preview") -> str:
+    """获取图片的JSON描述 (用于精准修图)
+
+    降级链: YUNWU -> Google-API
+
+    Args:
+        image_path: 图片路径
+        model: 使用的模型
+
+    Returns:
+        JSON格式的图片描述，或错误信息
+    """
+    # 读取图片并编码
+    img_path = Path(image_path).expanduser()
+    if not img_path.exists():
+        return f"[错误] 图片不存在: {image_path}"
+
+    with open(img_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode()
+
+    errors = []
+
+    # 1. 优先使用 YUNWU (有余额)
+    result, error = _describe_image_api(
+        image_b64, model,
+        YUNWU_IMAGE_CONFIG["url"],
+        YUNWU_IMAGE_CONFIG["key"]
+    )
+    if result:
+        # 保存到SQLite
+        _save_image_description(str(img_path), result, model, "YUNWU")
+        return result
+    errors.append(f"YUNWU: {error}")
+
+    # 2. 降级到 Google-API
+    result, error = _describe_image_api(
+        image_b64, model,
+        GOOGLE_API_IMAGE_CONFIG["url"]
+    )
+    if result:
+        # 保存到SQLite
+        _save_image_description(str(img_path), result, model, "Google-API")
+        return result
+    errors.append(f"Google-API: {error}")
+
+    return f"[错误] 所有API都失败: {' | '.join(errors)}"
+
+
+def _generate_image_google_dedicated(prompt: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
+    """使用 google-api 专用图片端点生成图片
+
+    - 文生图: /v1/generate-images
+    - 图生图: /v1/images/edit
+    """
+    import urllib.request
+    import urllib.error
+
+    # 从 GOOGLE_API_URL 提取 base URL
+    base_url = os.environ.get("GOOGLE_API_URL", "").rsplit("/v1/", 1)[0]
+    if not base_url:
+        return None, "未配置 GOOGLE_API_URL"
+
+    if ref_image_b64:
+        # 图生图：使用 /v1/images/edit
+        url = f"{base_url}/v1/images/edit"
+        payload = {
+            "prompt": prompt,
+            "image": f"data:image/png;base64,{ref_image_b64}",
+            "response_type": "base64"
+        }
+    else:
+        # 文生图：使用 /v1/generate-images
+        url = f"{base_url}/v1/generate-images"
+        payload = {
+            "prompt": prompt,
+            "response_type": "base64"
+        }
+
+    headers = {"Content-Type": "application/json"}
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            if "images" in result and len(result["images"]) > 0:
+                img_data = result["images"][0]
+                # 移除 data:image 前缀
+                if img_data.startswith("data:image"):
+                    img_data = img_data.split(",", 1)[1]
+                return base64.b64decode(img_data), ""
+
+            return None, f"响应异常: {json.dumps(result, ensure_ascii=False)[:200]}"
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        return None, f"HTTP {e.code}: {error_body[:200]}"
+    except Exception as e:
+        return None, str(e)
+
+
+def edit_image_with_json(image_path: str, json_desc: str, model: str = DEFAULT_IMAGE_MODEL, verbose: bool = True) -> str:
+    """根据JSON描述生成新图片 (JSON精准修图)
+
+    Args:
+        image_path: 原图路径 (可选，用于参考)
+        json_desc: 修改后的JSON描述
+        model: 图片生成模型
+        verbose: 是否显示详细信息
+
+    Returns:
+        生成图片的URL或错误信息
+    """
+    # 构建生成提示词
+    prompt = f"请根据以下JSON描述生成一张新图片：\n\n{json_desc}"
+
+    # 如果提供了原图，作为参考
+    ref_image = image_path if image_path and Path(image_path).expanduser().exists() else None
+
+    return generate_and_upload_image(prompt, model, verbose, ref_image)
+
+
+def single_prompt(prompt, model, backend_name, output_json=False, use_stream=False):
+    """单次提问模式"""
+    backend_config = BACKENDS[backend_name]
+    model = resolve_model(model)
+
+    # 提取图片路径（支持带空格的路径）
+    cleaned_text, image_paths = extract_local_image_paths(prompt)
+
+    # 构建消息
+    if image_paths:
+        # 多模态消息（包含图片）
+        user_message = {
+            "role": "user",
+            "content": [{"type": "text", "text": cleaned_text or "请分析图片"}] + [
+                {"type": "image_file", "path": str(p)} for p in image_paths
+            ],
+        }
+        messages = [user_message]
+    else:
+        # 纯文本消息
+        messages = [{"role": "user", "content": prompt}]
+
+    if use_stream and not output_json:
+        response = chat_request_with_fallback_stream(messages, model, backend_config, quiet=True, show_spinner=False)
+    else:
+        response = chat_request_with_fallback(messages, model, backend_config, quiet=True, show_spinner=False)
+
+    if output_json:
+        result = {
+            "model": model,
+            "backend": backend_name,
+            "prompt": prompt,
+            "response": response,
+            "success": not response.startswith("[")
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif not use_stream:
+        print(response)
+
+def list_models():
+    """列出可用模型"""
+    print("可用模型:")
+    print("  flash   -> gemini-3-flash-preview (最新 3.0 Flash) ⭐ 推荐")
+    print("  flash3  -> gemini-3-flash-preview (同上)")
+    print("  flash2  -> gemini-2.5-flash (旧版 Flash)")
+    print("  pro     -> gemini-2.5-pro (Pro)")
+    print("  pro3    -> gemini-3.0-pro (3.0 Pro)")
+    print()
+    print("可用后端:")
+    for name, config in BACKENDS.items():
+        tools_support = "✅ 支持Function Calling" if config.get("supports_tools") else ""
+        print(f"  {name:8} -> {config['name']} {tools_support}")
+    print()
+    print("可用工具 (用于Function Calling):")
+    for name, tool in BUILTIN_TOOLS.items():
+        print(f"  {name:12} -> {tool['description']}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Turing CLI - 多轮会话命令行工具 (Claude Code 的轻量多模型网关)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  turing                    开启新对话 (流式输出)
+  turing -c                 继续上次对话
+  turing -m pro             使用 pro 模型
+  turing -p "解释量子计算"   单次提问
+  turing -p "问题" --json   JSON 格式输出 (脚本集成)
+  turing --backend openai   使用 OpenAI 后端
+
+图片功能:
+  turing -d a cute cat              生成图片 (免引号)
+  turing -d "修改提示" -r img.png   图生图 (垫图)
+  turing -D photo.jpg               获取图片JSON描述 (精准修图)
+  turing -E desc.json               根据JSON生成新图
+  turing -E desc.json -r orig.jpg   JSON修图 (参考原图)
+  turing -H                         查看图片历史
+  turing -H cat                     搜索历史 (关键词: cat)
+
+交互命令:
+  /read <file>   读取文件让 AI 分析
+  /write <file>  保存 AI 回复到文件
+  /sessions      列出所有会话
+  /stream        切换流式输出
+  /help          查看更多命令
+        """
+    )
+
+    parser.add_argument('-m', '--model', default='flash3',
+                        help='模型名称 (flash3/pro3/pro/flash，默认: flash3)')
+    parser.add_argument('-p', '--prompt',
+                        help='单次提问（不进入交互模式）')
+    parser.add_argument('-c', '--continue', dest='continue_session', action='store_true',
+                        help='继续上次会话（自动加载最近的历史记录）')
+    parser.add_argument('-b', '--backend', default='google',
+                        choices=BACKENDS.keys(),
+                        help='后端选择 (默认: google)')
+    parser.add_argument('--json', dest='output_json', action='store_true',
+                        help='输出 JSON 格式（用于脚本集成）')
+    parser.add_argument('--no-stream', dest='no_stream', action='store_true',
+                        help='禁用流式输出')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='安静模式（不显示交互式UI，仅输出结果）')
+    parser.add_argument('--list-models', action='store_true',
+                        help='列出可用模型和后端')
+    parser.add_argument('--draw', '-d', nargs='*', metavar='WORD',
+                        help='生成图片，支持免引号 (如: turing -d a cute cat)')
+    parser.add_argument('--image-model', type=str, default=DEFAULT_IMAGE_MODEL,
+                        help='图片生成模型 (image, image-2k, image-4k, image-flash)')
+    parser.add_argument('--ref', '-r', type=str, metavar='IMAGE_PATH',
+                        help='参考图片路径 (垫图，用于图生图)')
+    parser.add_argument('--describe', '-D', type=str, metavar='IMAGE_PATH',
+                        help='获取图片的JSON描述 (用于精准修图)')
+    parser.add_argument('--edit-json', '-E', type=str, metavar='JSON_FILE',
+                        help='根据JSON描述生成新图片 (JSON精准修图)')
+    parser.add_argument('--image-history', '-H', nargs='?', const='', metavar='SEARCH',
+                        help='查看图片历史 (可选搜索关键词)')
+    parser.add_argument('--history-limit', type=int, default=20,
+                        help='历史记录返回数量 (默认20)')
+
+    args = parser.parse_args()
+
+    if args.list_models:
+        list_models()
+        return
+
+    # 图片历史查询模式
+    if args.image_history is not None:
+        search = args.image_history if args.image_history else None
+        result = query_image_history(limit=args.history_limit, search=search)
+        print(result)
+        return
+
+    # JSON描述模式
+    if args.describe:
+        print(f"正在获取图片JSON描述: {args.describe}")
+        result = describe_image_json(args.describe)
+        print(result)
+        return
+
+    # JSON精准修图模式
+    if args.edit_json:
+        json_path = Path(args.edit_json).expanduser()
+        if not json_path.exists():
+            print(f"[错误] JSON文件不存在: {args.edit_json}")
+            return
+        with open(json_path, 'r', encoding='utf-8') as f:
+            json_desc = f.read()
+        print(f"正在根据JSON生成图片...")
+        image_model = IMAGE_MODELS.get(args.image_model, args.image_model)
+        result = edit_image_with_json(args.ref, json_desc, image_model)
+        print(result)
+        return
+
+    if args.draw is not None:
+        # 图片生成模式 (支持免引号: turing -d a cute cat)
+        prompt = ' '.join(args.draw) if args.draw else ""
+        if not prompt:
+            print("[错误] 请提供图片生成提示词")
+            return
+        image_model = IMAGE_MODELS.get(args.image_model, args.image_model)
+        result = generate_and_upload_image(prompt, image_model, ref_image=args.ref)
+        print(result)
+        return
+
+    if args.prompt:
+        single_prompt(args.prompt, args.model, args.backend,
+                     output_json=args.output_json,
+                     use_stream=False)
+    else:
+        interactive_mode(args.model, args.backend, continue_session=args.continue_session)
+
+if __name__ == "__main__":
+    main()
