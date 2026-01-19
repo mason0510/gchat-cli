@@ -1,5 +1,24 @@
 #!/bin/bash
-# claudeminimax - MiniMax API wrapper for Claude-compatible interface
+# =============================================================================
+# 架构角色: API 包装器 / 兼容层
+# 功能描述: MiniMax API 的 Claude 兼容接口包装器
+# =============================================================================
+# 输入: CLI参数 / 环境变量 (API Key)
+# 输出: stdout (claude 命令的输出)
+# 依赖: claude (Claude Code CLI 命令)
+# 配置: 硬编码 API Key (临时方案，后续应移至 ~/.gchat/.env)
+# =============================================================================
+# 入口:
+#   claudeminimax                    # 交互式 Claude Code
+#   claudeminimax "问题"             # 单次提问
+#   claudeminimax -p "问题" --json   # JSON 输出
+# 实现:
+#   设置 ANTHROPIC_* 环境变量后 exec claude
+# API: https://api.minimaxi.com/anthropic | 模型: MiniMax-M2.1
+# 相关:
+#   bin/claudeminimaxd   # Desktop 快捷
+#   bin/claudeminimaxcd  # Code 快捷
+# =============================================================================
 
 export ANTHROPIC_BASE_URL="https://api.minimaxi.com/anthropic"
 export ANTHROPIC_AUTH_TOKEN="sk-cp-QnQIXimRR5MkTKeq0zQ1gdzJYpeaO1iK5bG69mbP2PN3xnrMR-jIuHtxJHkXV_56l0pVF8mYY5XXUfq6ZoMpqw3ESrGdzzkCXCs6WhFdeUzbNVNHa2O933k"

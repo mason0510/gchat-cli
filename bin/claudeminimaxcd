@@ -1,4 +1,21 @@
 #!/bin/bash
-# claudeminimaxcd - 使用 MiniMax API 启动 Claude Code
+# =============================================================================
+# 架构角色: 快捷入口 / 封装器
+# 功能描述: Claude Code CLI 快捷启动 (跳过权限检查 + 继续会话)
+# =============================================================================
+# 输入: CLI参数 (透传给 claudeminimax)
+# 输出: stdout (透传 claudeminimax 输出)
+# 依赖: bin/claudeminimax (主包装器)
+# =============================================================================
+# 入口:
+#   claudeminimaxcd              # 启动 Claude Code
+#   claudeminimaxcd -c           # 继续上次会话
+#   claudeminimaxcd "问题"       # 单次提问
+# 实现:
+#   内部执行: claudeminimax --dangerously-skip-permissions -c [args]
+# 相关:
+#   bin/claudeminimax    # 主包装器
+#   bin/claudeminimaxd   # Desktop 快捷
+# =============================================================================
 
 claudeminimax --dangerously-skip-permissions -c "$@"

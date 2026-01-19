@@ -1,4 +1,20 @@
 #!/bin/bash
-# claudeminimaxd - MiniMax API wrapper for Claude Desktop
+# =============================================================================
+# 架构角色: 快捷入口 / 封装器
+# 功能描述: Claude Desktop 快捷启动 (跳过权限检查)
+# =============================================================================
+# 输入: CLI参数 (透传给 claudeminimax)
+# 输出: stdout (透传 claudeminimax 输出)
+# 依赖: bin/claudeminimax (主包装器)
+# =============================================================================
+# 入口:
+#   claudeminimaxd               # 启动 Claude Desktop
+#   claudeminimaxd "问题"        # 单次提问
+# 实现:
+#   内部执行: claudeminimax --dangerously-skip-permissions [args]
+# 相关:
+#   bin/claudeminimax    # 主包装器
+#   bin/claudeminimaxcd  # Code 快捷
+# =============================================================================
 
 claudeminimax --dangerously-skip-permissions "$@"

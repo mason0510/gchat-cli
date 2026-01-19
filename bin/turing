@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """
-Turing CLI - 多轮会话命令行工具
-支持多种后端：本地Gemini Reverse API、NexusAI等
-
-用法:
-    turing                    # 交互式多轮会话（默认 gemini-3-flash-preview）
-    gflashchat               # 使用 gemini-3-flash-preview
-    turing -m flash3          # 使用 flash3 模型
-    turing -p "你好"          # 单次提问
-    turing --backend nexus    # 使用NexusAI后端
-    turing --list-models      # 列出可用模型
+================================================================================
+架构角色: 主入口 / 多模型 CLI 网关 (gchat 的符号链接副本)
+功能描述: 支持 Gemini/GLM/Official API 的多轮会话命令行工具
+================================================================================
+输入: CLI参数 / 用户交互输入 / 图片文件
+输出: stdout (AI回复) / 会话历史文件
+依赖: claude-code (子进程调用), python libs (wcwidth, sqlite3)
+配置: ~/.gchat/.env (后端 API 地址和密钥)
+================================================================================
+入口:
+  turing                    # 交互式对话 (默认 flash3 模型)
+  turing -p "问题"          # 单次提问
+  turing -c                 # 继续上次会话
+  turing -m pro             # 指定模型
+  turing -d "描述"          # 文生图
+  turing -D image.png       # 图片分析
+相关:
+  bin/gchat                 # 主程序 (功能相同)
+  bin/gflashchat            # flash3 快捷方式
+  bin/claudeminimax*        # MiniMax API 包装器
+================================================================================
 """
 
 import argparse
