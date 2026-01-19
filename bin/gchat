@@ -104,31 +104,26 @@ _load_env_file()
 
 
 # ==================== 后端配置 ====================
-BACKENDS = {
-    "google": {
-        "url": os.environ.get("GOOGLE_API_URL", ""),
-        "name": "Google API (支持Function Calling)",
-        "supports_tools": True,
-    },
-    "local": {
-        "url": os.environ.get("LOCAL_API_URL", "http://localhost:8100/v1/chat/completions"),
-        "name": "Gemini Reverse API (本地)",
-        "supports_tools": False,
-    },
-    "nexus": {
-        "url": os.environ.get("NEXUSAI_URL", ""),
-        "key": os.environ.get("NEXUSAI_KEY", ""),
-        "name": "NexusAI",
-        "supports_tools": False,
-    },
-    "official": {
-        "url": os.environ.get("GEMINI_OFFICIAL_URL", "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"),
-        "key": os.environ.get("GEMINI_API_KEY", ""),
-        "name": "Google Official API",
-        "supports_tools": True,
-        "default_model": "gemini-2.5-flash-lite",
-    },
-}
+# 根据命令名称（gchat/turing）自动读取对应环境变量
+def get_backend_config():
+    """根据命令名称获取后端配置"""
+    command_name = os.path.basename(sys.argv[0])
+
+    if command_name == "turing":
+        return {
+            "url": os.environ.get("TURING_BASE_URL", ""),
+            "key": os.environ.get("TURING_SPECIAL_GEMINI_GROUP_KEY", ""),
+            "name": "Turing",
+        }
+    else:  # gchat
+        return {
+            "url": os.environ.get("GCHAT_BASE_URL", ""),
+            "key": os.environ.get("GCHAT_KEY", ""),
+            "name": "GChat",
+        }
+
+# 获取当前后端配置
+BACKEND_CONFIG = get_backend_config()
 
 # 官方API模型映射 (逆向模型名 -> 官方模型名)
 OFFICIAL_MODEL_MAP = {
@@ -1540,9 +1535,9 @@ def execute_function(name, args):
         return {"error": f"未知函数: {name}"}
 
 
-def interactive_mode(model, backend_name, continue_session=False, verbose=False):
+def interactive_mode(model, continue_session=False, verbose=False):
     """交互式多轮会话"""
-    backend_config = BACKENDS[backend_name]
+    backend_config = BACKEND_CONFIG
     model = resolve_model(model)
     messages = []
     loaded_file = None
@@ -1850,13 +1845,10 @@ def interactive_mode(model, backend_name, continue_session=False, verbose=False)
                         print(f"当前模型: {model}")
                         print(f"可用模型: flash, pro, pro3")
                 elif cmd == 'backend':
-                    if cmd_arg and cmd_arg in BACKENDS:
-                        backend_name = cmd_arg
-                        backend_config = BACKENDS[backend_name]
-                        print(colored(f"→ {backend_name}", Color.GREEN))
-                    else:
-                        print(f"当前后端: {backend_config['name']}")
-                        print(f"可用后端: {', '.join(BACKENDS.keys())}")
+                    command_name = os.path.basename(sys.argv[0])
+                    print(f"当前命令: {command_name}")
+                    print(f"当前后端: {backend_config['name']}")
+                    print(f"环境变量: {command_name.upper()}_BASE_URL, {command_name.upper()}_KEY")
                 elif cmd == 'status':
                     turns = len(messages) // 2
                     stream_status = "on" if use_stream else "off"
@@ -1951,7 +1943,7 @@ def interactive_mode(model, backend_name, continue_session=False, verbose=False)
                     print()  # AI response follows
                     # verbose 模式下显示 API 调用信息
                     if verbose:
-                        backend_display = backend_config.get('name', backend_name)
+                        backend_display = backend_config.get('name', 'Unknown')
                         print(colored(f"→ {model} · {backend_display} · Thinking...", Color.DIM))
                     if use_stream:
                         response = chat_request_with_fallback_stream(messages, model, backend_config, show_spinner=show_spinner)
@@ -2205,41 +2197,16 @@ def interactive_mode(model, backend_name, continue_session=False, verbose=False)
             if compressed:
                 print(colored("○ context compressed", Color.DIM))
 
-            if enabled_tools and backend_config.get("supports_tools"):
-                # 有工具且后端支持时，使用工具调用
-                if backend_name == "google":
-                    # google 后端使用 OpenAI 格式
-                    result, error = openai_tools_request(messages, model, enabled_tools, backend_config)
-                else:
-                    # official 后端使用 Gemini 原生格式
-                    result, error = official_api_request(messages, model, enabled_tools)
+            # 工具调用暂不支持（简化配置后）
+            # if enabled_tools and backend_config.get("supports_tools"):
+            #     result, error = openai_tools_request(messages, model, enabled_tools, backend_config)
 
-                if error:
-                    print(colored(error, Color.RED))
-                    messages.pop()  # 移除失败的消息
-                    continue
-
-                if result["type"] == "function_call":
-                    fc_name = result["name"]
-                    fc_args = result["args"]
-                    print(colored(f"📞 函数调用: {fc_name}({json.dumps(fc_args, ensure_ascii=False)})", Color.YELLOW))
-
-                    # 执行函数
-                    fc_result = execute_function(fc_name, fc_args)
-                    print(colored(f"📤 函数结果: {json.dumps(fc_result, ensure_ascii=False)}", Color.GREEN))
-
-                    # 记录到历史
-                    response = f"[调用函数 {fc_name}]\n参数: {json.dumps(fc_args, ensure_ascii=False)}\n结果: {json.dumps(fc_result, ensure_ascii=False)}"
-                else:
-                    response = result["content"]
-                    print(response)
+            # 普通请求
+            if use_stream:
+                response = chat_request_with_fallback_stream(messages, model, backend_config, show_spinner=show_spinner)
             else:
-                # 无工具或后端不支持时使用普通请求
-                if use_stream:
-                    response = chat_request_with_fallback_stream(messages, model, backend_config, show_spinner=show_spinner)
-                else:
-                    response = chat_request_with_fallback(messages, model, backend_config)
-                    print(response)
+                response = chat_request_with_fallback(messages, model, backend_config)
+                print(response)
 
             print()
 
@@ -3022,9 +2989,9 @@ def edit_image_with_json(image_path: str, json_desc: str, model: str = DEFAULT_I
     return generate_and_upload_image(prompt, model, verbose, ref_image)
 
 
-def single_prompt(prompt, model, backend_name, output_json=False, use_stream=False):
+def single_prompt(prompt, model, output_json=False, use_stream=False):
     """单次提问模式"""
-    backend_config = BACKENDS[backend_name]
+    backend_config = BACKEND_CONFIG
     model = resolve_model(model)
 
     # 提取图片路径（支持带空格的路径）
@@ -3052,7 +3019,7 @@ def single_prompt(prompt, model, backend_name, output_json=False, use_stream=Fal
     if output_json:
         result = {
             "model": model,
-            "backend": backend_name,
+            "backend": os.path.basename(sys.argv[0]),  # 使用命令名称作为 backend
             "prompt": prompt,
             "response": response,
             "success": not response.startswith("[")
@@ -3063,6 +3030,7 @@ def single_prompt(prompt, model, backend_name, output_json=False, use_stream=Fal
 
 def list_models():
     """列出可用模型"""
+    command_name = os.path.basename(sys.argv[0]).upper()
     print("可用模型:")
     print("  flash   -> gemini-3-flash-preview (最新 3.0 Flash) ⭐ 推荐")
     print("  flash3  -> gemini-3-flash-preview (同上)")
@@ -3070,14 +3038,13 @@ def list_models():
     print("  pro     -> gemini-2.5-pro (Pro)")
     print("  pro3    -> gemini-3.0-pro (3.0 Pro)")
     print()
-    print("可用后端:")
-    for name, config in BACKENDS.items():
-        tools_support = "✅ 支持Function Calling" if config.get("supports_tools") else ""
-        print(f"  {name:8} -> {config['name']} {tools_support}")
+    print(f"当前配置 ({command_name}):")
+    print(f"  BASE_URL: {BACKEND_CONFIG['url'] or '未设置'}")
+    print(f"  KEY: {'已设置' if BACKEND_CONFIG.get('key') else '未设置'}")
     print()
-    print("可用工具 (用于Function Calling):")
-    for name, tool in BUILTIN_TOOLS.items():
-        print(f"  {name:12} -> {tool['description']}")
+    print(f"配置方式:")
+    print(f"  export {command_name}_BASE_URL='https://...'")
+    print(f"  export {command_name}_KEY='sk-...'")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -3090,7 +3057,11 @@ def main():
   gchat -m pro             使用 pro 模型
   gchat -p "解释量子计算"   单次提问
   gchat -p "问题" --json   JSON 格式输出 (脚本集成)
-  gchat --backend openai   使用 OpenAI 后端
+
+配置:
+  通过环境变量配置供应商:
+  export GCHAT_BASE_URL="https://api.provider.com/v1/chat/completions"
+  export GCHAT_KEY="sk-your-api-key"
 
 图片功能:
   gchat -d a cute cat              生成图片 (免引号)
@@ -3116,9 +3087,6 @@ def main():
                         help='单次提问（不进入交互模式）')
     parser.add_argument('-c', '--continue', dest='continue_session', action='store_true',
                         help='继续上次会话（自动加载最近的历史记录）')
-    parser.add_argument('-b', '--backend', default='google',
-                        choices=BACKENDS.keys(),
-                        help='后端选择 (默认: google)')
     parser.add_argument('--json', dest='output_json', action='store_true',
                         help='输出 JSON 格式（用于脚本集成）')
     parser.add_argument('--no-stream', dest='no_stream', action='store_true',
@@ -3188,11 +3156,11 @@ def main():
         return
 
     if args.prompt:
-        single_prompt(args.prompt, args.model, args.backend,
+        single_prompt(args.prompt, args.model,
                      output_json=args.output_json,
                      use_stream=False)
     else:
-        interactive_mode(args.model, args.backend,
+        interactive_mode(args.model,
                         continue_session=args.continue_session)
 
 if __name__ == "__main__":
