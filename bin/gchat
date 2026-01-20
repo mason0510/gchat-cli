@@ -2436,13 +2436,13 @@ def _generate_image_gptload(prompt: str, model: str) -> tuple[bytes, str] | tupl
         return None, f"[GPT-Load错误] {e}"
 
 
-def _generate_image_yunwu(prompt: str, model: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
+def _generate_image_yunwu(prompt: str, model: str, ref_image_b64_list: list = None) -> tuple[bytes, str] | tuple[None, str]:
     """使用 YUNWU Chat API 生成图片 (chat completions with image model)
 
     Args:
         prompt: 图片生成提示词
         model: 图片生成模型
-        ref_image_b64: 参考图片的base64编码 (用于图生图)
+        ref_image_b64_list: 参考图片的base64编码列表 (用于图生图，最多3张)
     """
     import urllib.request
     import urllib.error
@@ -2454,12 +2454,14 @@ def _generate_image_yunwu(prompt: str, model: str, ref_image_b64: str = None) ->
     }
 
     # 构建消息内容
-    if ref_image_b64:
-        # 图生图模式：包含参考图片
+    if ref_image_b64_list:
+        # 图生图模式：包含多张参考图片
         content = [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_image_b64}"}}
         ]
+        # 添加所有参考图片
+        for ref_b64 in ref_image_b64_list:
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_b64}"}})
     else:
         content = prompt
 
@@ -2497,13 +2499,13 @@ def _generate_image_yunwu(prompt: str, model: str, ref_image_b64: str = None) ->
         return None, f"[YUNWU错误] {e}"
 
 
-def _generate_image_google_api(prompt: str, model: str, ref_image_b64: str = None) -> tuple[bytes, str] | tuple[None, str]:
+def _generate_image_google_api(prompt: str, model: str, ref_image_b64_list: list = None) -> tuple[bytes, str] | tuple[None, str]:
     """使用 Google API (最终降级，Cookie模式无需Key)
 
     Args:
         prompt: 图片生成提示词
         model: 图片生成模型
-        ref_image_b64: 参考图片的base64编码 (用于图生图)
+        ref_image_b64_list: 参考图片的base64编码列表 (用于图生图，最多3张)
     """
     import urllib.request
     import urllib.error
@@ -2514,12 +2516,14 @@ def _generate_image_google_api(prompt: str, model: str, ref_image_b64: str = Non
     }
 
     # 构建消息内容
-    if ref_image_b64:
-        # 图生图模式：包含参考图片
+    if ref_image_b64_list:
+        # 图生图模式：包含多张参考图片
         content = [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_image_b64}"}}
         ]
+        # 添加所有参考图片
+        for ref_b64 in ref_image_b64_list:
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{ref_b64}"}})
     else:
         content = prompt
 
@@ -2556,34 +2560,35 @@ def _generate_image_google_api(prompt: str, model: str, ref_image_b64: str = Non
         return None, f"[Google-API错误] {e}"
 
 
-def generate_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, ref_image_b64: str = None) -> tuple[bytes, str, str] | tuple[None, str, str]:
+def generate_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, ref_image_b64_list: list = None) -> tuple[bytes, str, str] | tuple[None, str, str]:
     """生成图片 (多API降级：GPT-Load -> YUNWU -> ZYAI -> NexusAI -> Google-API)
 
     Args:
         prompt: 图片生成提示词
         model: 图片生成模型
-        ref_image_b64: 参考图片的base64编码 (用于图生图)
+        ref_image_b64_list: 参考图片的base64编码列表 (用于图生图，最多3张)
 
     返回: (图片数据, 生成源, 错误信息)
     """
     errors = []
 
     # 如果有参考图片，使用支持图生图的API降级链
-    if ref_image_b64:
+    if ref_image_b64_list:
         # 1. 优先使用 YUNWU (有余额，chat completions支持图生图)
-        image_data, error = _generate_image_yunwu(prompt, model, ref_image_b64)
+        image_data, error = _generate_image_yunwu(prompt, model, ref_image_b64_list)
         if image_data:
             return image_data, "YUNWU", ""
         errors.append(f"YUNWU: {error}")
 
         # 2. 降级到 Google-API (chat completions支持图生图)
-        image_data, error = _generate_image_google_api(prompt, model, ref_image_b64)
+        image_data, error = _generate_image_google_api(prompt, model, ref_image_b64_list)
         if image_data:
             return image_data, "Google-API", ""
         errors.append(f"Google-API: {error}")
 
         # 3. 最终降级：Google 专用图片编辑端点 (/v1/images/edit)
-        image_data, error = _generate_image_google_dedicated(prompt, ref_image_b64)
+        # 注意：专用端点只支持单图，使用第一张
+        image_data, error = _generate_image_google_dedicated(prompt, ref_image_b64_list[0])
         if image_data:
             return image_data, "Google-Edit", ""
         errors.append(f"Google-Edit: {error}")
@@ -2790,33 +2795,37 @@ def query_image_history(limit: int = 20, search: str = None, desc_only: bool = F
     return "\n".join(results)
 
 
-def generate_and_upload_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, verbose: bool = True, ref_image: str = None) -> str:
+def generate_and_upload_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, verbose: bool = True, ref_images: list = None) -> str:
     """生成图片并上传到 R2，返回公开URL或错误信息
 
     Args:
         prompt: 图片生成提示词
         model: 图片生成模型
         verbose: 是否显示详细信息
-        ref_image: 参考图片路径 (垫图，用于图生图)
+        ref_images: 参考图片路径列表 (垫图，用于图生图，最多3张)
     """
     from datetime import datetime
     import hashlib
 
     start_time = time.time()
 
-    # 如果有参考图片，读取并编码
-    ref_image_data = None
-    if ref_image:
-        # 支持本地路径和网络URL
-        ref_path = resolve_image_path(ref_image)
-        if ref_path:
-            with open(ref_path, "rb") as f:
-                ref_image_data = base64.b64encode(f.read()).decode()
-        else:
-            return f"[错误] 参考图片不存在或下载失败: {ref_image}"
+    # 如果有参考图片，读取并编码（支持多张）
+    ref_image_data_list = None
+    if ref_images:
+        if len(ref_images) > 3:
+            return f"[错误] 参考图片最多支持3张，当前传入{len(ref_images)}张"
+        ref_image_data_list = []
+        for ref_image in ref_images:
+            # 支持本地路径和网络URL
+            ref_path = resolve_image_path(ref_image)
+            if ref_path:
+                with open(ref_path, "rb") as f:
+                    ref_image_data_list.append(base64.b64encode(f.read()).decode())
+            else:
+                return f"[错误] 参考图片不存在或下载失败: {ref_image}"
 
     # 生成图片
-    image_data, source, error = generate_image(prompt, model, ref_image_data)
+    image_data, source, error = generate_image(prompt, model, ref_image_data_list)
     if error:
         return error
     if not image_data:
@@ -2835,14 +2844,15 @@ def generate_and_upload_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, ver
     upload_time = time.time() - upload_start
     total_time = time.time() - start_time
 
-    # 保存历史记录
+    # 保存历史记录（保存第一张参考图路径）
+    ref_image_for_history = ref_images[0] if ref_images else None
     if url.startswith("http"):
-        _save_image_history(prompt, url, model, source, ref_image, gen_time, upload_time)
+        _save_image_history(prompt, url, model, source, ref_image_for_history, gen_time, upload_time)
 
     # 返回结果（包含元信息）
     if url.startswith("http"):
         if verbose:
-            ref_info = f" [垫图: {ref_image}]" if ref_image else ""
+            ref_info = f" [垫图: {len(ref_images)}张]" if ref_images else ""
             return f"{url}\n[{source}] {gen_time:.1f}s生成 + {upload_time:.1f}s上传 = {total_time:.1f}s{ref_info}"
         return url
     return url  # 错误信息
@@ -3037,9 +3047,9 @@ def edit_image_with_json(image_path: str, json_desc: str, model: str = DEFAULT_I
     prompt = f"请根据以下JSON描述生成一张新图片：\n\n{json_desc}"
 
     # 如果提供了原图，作为参考（支持URL和本地路径）
-    ref_image = image_path if image_path else None
+    ref_images = [image_path] if image_path else None
 
-    return generate_and_upload_image(prompt, model, verbose, ref_image)
+    return generate_and_upload_image(prompt, model, verbose, ref_images)
 
 
 def single_prompt(prompt, model, output_json=False, use_stream=False):
@@ -3118,7 +3128,7 @@ def main():
 
 图片功能:
   gchat -d a cute cat              生成图片 (免引号)
-  gchat -d "修改提示" -r img.png   图生图 (垫图)
+  gchat -d "修改提示" -r img1.png img2.png img3.png   图生图 (垫图，最多3张)
   gchat -D photo.jpg               获取图片JSON描述 (精准修图)
   gchat -E desc.json               根据JSON生成新图
   gchat -E desc.json -r orig.jpg   JSON修图 (参考原图)
@@ -3152,8 +3162,8 @@ def main():
                         help='生成图片，支持免引号 (如: gchat -d a cute cat)')
     parser.add_argument('--image-model', type=str, default=DEFAULT_IMAGE_MODEL,
                         help='图片生成模型 (image, image-flash)')
-    parser.add_argument('--ref', '-r', type=str, metavar='IMAGE_PATH',
-                        help='参考图片路径 (垫图，用于图生图)')
+    parser.add_argument('--ref', '-r', nargs='*', metavar='IMAGE_PATH',
+                        help='参考图片路径，最多3张 (垫图，用于图生图)')
     parser.add_argument('--describe', '-D', type=str, metavar='IMAGE_PATH',
                         help='获取图片的JSON描述 (用于精准修图)')
     parser.add_argument('--edit-json', '-E', type=str, metavar='JSON_FILE',
@@ -3193,7 +3203,9 @@ def main():
             json_desc = f.read()
         print(f"正在根据JSON生成图片...")
         image_model = IMAGE_MODELS.get(args.image_model, args.image_model)
-        result = edit_image_with_json(args.ref, json_desc, image_model)
+        # JSON修图模式只使用第一张参考图
+        ref_image = args.ref[0] if args.ref else None
+        result = edit_image_with_json(ref_image, json_desc, image_model)
         print(result)
         return
 
@@ -3204,7 +3216,7 @@ def main():
             print("[错误] 请提供图片生成提示词")
             return
         image_model = IMAGE_MODELS.get(args.image_model, args.image_model)
-        result = generate_and_upload_image(prompt, image_model, ref_image=args.ref)
+        result = generate_and_upload_image(prompt, image_model, ref_images=args.ref)
         print(result)
         return
 
