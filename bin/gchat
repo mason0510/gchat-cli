@@ -2378,9 +2378,19 @@ def _generate_image_nexusai(prompt: str, model: str) -> tuple[bytes, str] | tupl
 
             # 格式2: {"data": [{"b64_json": "..."}]}
             if "data" in result and len(result["data"]) > 0:
-                b64_data = result["data"][0].get("b64_json")
+                item = result["data"][0]
+                b64_data = item.get("b64_json")
                 if b64_data:
                     return base64.b64decode(b64_data), ""
+
+                # 格式3: {"data": [{"url": "..."}]} - 下载URL
+                img_url = item.get("url")
+                if img_url:
+                    try:
+                        with urllib.request.urlopen(img_url, timeout=60) as img_resp:
+                            return img_resp.read(), ""
+                    except Exception as e:
+                        return None, f"[NexusAI图片下载失败] {e}"
 
             return None, f"[NexusAI响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
 
