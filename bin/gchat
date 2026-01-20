@@ -2456,6 +2456,7 @@ def _generate_image_yunwu(prompt: str, model: str, ref_image_b64_list: list = No
     """
     import urllib.request
     import urllib.error
+    import re
 
     url = YUNWU_IMAGE_CONFIG["url"]
     headers = {
@@ -2491,14 +2492,33 @@ def _generate_image_yunwu(prompt: str, model: str, ref_image_b64_list: list = No
             # Chat completions 格式响应
             if "choices" in result and len(result["choices"]) > 0:
                 msg_content = result["choices"][0].get("message", {}).get("content", "")
-                # 检查是否包含 base64 图片数据
-                if "data:image" in str(msg_content):
-                    # 提取 base64 部分
-                    import re
-                    content_str = str(msg_content) if not isinstance(msg_content, str) else msg_content
+                content_str = str(msg_content) if not isinstance(msg_content, str) else msg_content
+
+                # 格式1: base64 图片数据
+                if "data:image" in content_str:
                     match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', content_str)
                     if match:
                         return base64.b64decode(match.group(1)), ""
+
+                # 格式2: Markdown 格式的图片URL ![image](url)
+                match = re.search(r'!\[image\]\((https?://[^\)]+)\)', content_str)
+                if match:
+                    img_url = match.group(1)
+                    try:
+                        with urllib.request.urlopen(img_url, timeout=60) as img_resp:
+                            return img_resp.read(), ""
+                    except Exception as e:
+                        return None, f"[YUNWU图片下载失败] {e}"
+
+                # 格式3: 直接的URL
+                match = re.search(r'(https?://[^\s]+\.(?:png|jpg|jpeg|webp))', content_str)
+                if match:
+                    img_url = match.group(1)
+                    try:
+                        with urllib.request.urlopen(img_url, timeout=60) as img_resp:
+                            return img_resp.read(), ""
+                    except Exception as e:
+                        return None, f"[YUNWU图片下载失败] {e}"
 
             return None, f"[YUNWU响应异常] {json.dumps(result, ensure_ascii=False)[:200]}"
 
