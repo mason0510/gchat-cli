@@ -2780,10 +2780,14 @@ def query_image_history(limit: int = 20, search: str = None, desc_only: bool = F
         for row in gen_rows:
             time_str = row['timestamp'][:19].replace('T', ' ')
             gen_info = f" ({row['gen_time']:.1f}s)" if row['gen_time'] else ""
-            ref_info = f" [垫图]" if row['ref_image'] else ""
-            results.append(f"[生成] {time_str} | {row['source']}{gen_info}{ref_info}")
-            results.append(f"       {row['prompt'][:60]}{'...' if len(row['prompt']) > 60 else ''}")
-            results.append(f"       {row['url']}")
+            results.append(f"[生成] {time_str} | {row['source']}{gen_info}")
+            results.append(f"       {row['prompt'][:80]}{'...' if len(row['prompt']) > 80 else ''}")
+            results.append(f"       → {row['url']}")
+            # 显示参考图片
+            if row['ref_image']:
+                ref_urls = row['ref_image'].split(',')
+                for i, ref in enumerate(ref_urls, 1):
+                    results.append(f"       参考{i}: {ref}")
             results.append("")
 
     # 查询图片描述历史
@@ -2823,6 +2827,116 @@ def query_image_history(limit: int = 20, search: str = None, desc_only: bool = F
         return "暂无历史记录"
 
     return "\n".join(results)
+
+
+def _get_styles_dir() -> str:
+    """获取风格目录路径"""
+    import os
+    styles_dir = os.path.expanduser("~/.gchat/styles")
+    os.makedirs(styles_dir, exist_ok=True)
+    return styles_dir
+
+
+def list_styles() -> list:
+    """列出所有可用的风格"""
+    import os
+    import json
+
+    styles_dir = _get_styles_dir()
+    styles = []
+
+    if not os.path.exists(styles_dir):
+        return styles
+
+    for filename in os.listdir(styles_dir):
+        if filename.endswith(".json") and filename != "README.md":
+            filepath = os.path.join(styles_dir, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    style = json.load(f)
+                    styles.append(style)
+            except:
+                pass
+
+    return styles
+
+
+def get_style(style_id: str):
+    """根据ID获取风格定义"""
+    for style in list_styles():
+        if style.get("style_id") == style_id:
+            return style
+    return None
+
+
+def query_style(style_id: str = "") -> str:
+    """查询风格信息
+
+    Args:
+        style_id: 风格ID，空字符串表示列出所有风格
+
+    Returns:
+        格式化的风格信息字符串
+    """
+    styles = list_styles()
+
+    if not styles:
+        return "暂无风格定义，请在 ~/.gchat/styles/ 目录下创建风格JSON文件"
+
+    # 如果指定了风格ID，显示详情
+    if style_id:
+        style = get_style(style_id)
+        if not style:
+            # 尝试模糊匹配
+            for s in styles:
+                if style_id.lower() in s.get("style_id", "").lower() or style_id in s.get("name", ""):
+                    style = s
+                    break
+
+        if not style:
+            available = ", ".join([s.get("style_id", "") for s in styles])
+            return f"未找到风格 '{style_id}'\n可用风格: {available}"
+
+        # 显示风格详情
+        lines = []
+        lines.append(f"=== {style.get('name', '')} ===")
+        lines.append(f"ID: {style.get('style_id', '')}")
+        lines.append(f"描述: {style.get('description', '')}")
+        lines.append(f"标签: {', '.join(style.get('tags', []))}")
+
+        if "color_palette" in style:
+            palette = style["color_palette"]
+            lines.append(f"色彩: 主色 {palette.get('primary', [])} / 点缀 {palette.get('accent', [])}")
+
+        if "prompt_template" in style:
+            lines.append(f"提示词模板: {style['prompt_template']}")
+
+        if "example_poses" in style:
+            lines.append(f"姿势示例: {', '.join(style.get('example_poses', []))}")
+
+        if "example_settings" in style:
+            lines.append(f"场景示例: {', '.join(style.get('example_settings', []))}")
+
+        if "reference_images" in style and style["reference_images"]:
+            lines.append("参考图:")
+            for ref in style["reference_images"][:3]:  # 只显示前3张
+                lines.append(f"  - {ref}")
+
+        return "\n".join(lines)
+
+    # 列出所有风格
+    lines = ["=== 可用风格 ==="]
+    for style in styles:
+        style_id = style.get("style_id", "")
+        name = style.get("name", "")
+        tags = ", ".join(style.get("tags", [])[:3])  # 只显示前3个标签
+        desc = style.get("description", "")[:40] + "..." if len(style.get("description", "")) > 40 else style.get("description", "")
+        lines.append(f"\n[{style_id}] {name}")
+        lines.append(f"    标签: {tags}")
+        lines.append(f"    {desc}")
+
+    lines.append(f"\n使用: turing -S <风格ID> 查看详情")
+    return "\n".join(lines)
 
 
 def generate_and_upload_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, verbose: bool = True, ref_images: list = None) -> str:
@@ -2874,8 +2988,8 @@ def generate_and_upload_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, ver
     upload_time = time.time() - upload_start
     total_time = time.time() - start_time
 
-    # 保存历史记录（保存第一张参考图路径）
-    ref_image_for_history = ref_images[0] if ref_images else None
+    # 保存历史记录（保存所有参考图，用逗号分隔）
+    ref_image_for_history = ','.join(ref_images) if ref_images else None
     if url.startswith("http"):
         _save_image_history(prompt, url, model, source, ref_image_for_history, gen_time, upload_time)
 
@@ -3198,6 +3312,8 @@ def main():
                         help='获取图片的JSON描述 (用于精准修图)')
     parser.add_argument('--edit-json', '-E', type=str, metavar='JSON_FILE',
                         help='根据JSON描述生成新图片 (JSON精准修图)')
+    parser.add_argument('--style', '-S', nargs='?', const='', metavar='STYLE_ID',
+                        help='使用风格 (无参数=列出所有风格, 指定ID=查看详情)')
     parser.add_argument('--image-history', '-H', nargs='?', const='', metavar='SEARCH',
                         help='查看图片历史 (可选搜索关键词)')
     parser.add_argument('--history-limit', type=int, default=20,
@@ -3207,6 +3323,12 @@ def main():
 
     if args.list_models:
         list_models()
+        return
+
+    # 风格查询模式
+    if args.style is not None:
+        result = query_style(args.style)
+        print(result)
         return
 
     # 图片历史查询模式
