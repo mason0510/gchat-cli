@@ -152,8 +152,6 @@ FALLBACK_MODELS = {
 # 图片生成模型
 IMAGE_MODELS = {
     "image": "gemini-3-pro-image-preview",  # 默认
-    "image-2k": "gemini-3-pro-image-preview-2k",
-    "image-4k": "gemini-3-pro-image-preview-4k",
     "image-flash": "gemini-2.5-flash-image",
 }
 
@@ -391,6 +389,57 @@ def encode_image_to_data_url(path: Path) -> str:
     data = path.read_bytes()
     b64 = base64.b64encode(data).decode('ascii')
     return f"data:{mime};base64,{b64}"
+
+
+def download_url_to_temp(url: str) -> Path | None:
+    """下载网络图片到临时文件
+
+    Args:
+        url: 图片URL
+
+    Returns:
+        临时文件路径，失败返回 None
+    """
+    import urllib.request
+    import urllib.error
+    import tempfile
+
+    # 检测是否为 URL
+    if not url.startswith(('http://', 'https://')):
+        return None
+
+    try:
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
+            # 下载图片
+            request = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                tmp.write(response.read())
+            return Path(tmp.name)
+    except Exception as e:
+        return None
+
+
+def resolve_image_path(path_or_url: str) -> Path | None:
+    """解析图片路径（支持本地路径和网络URL）
+
+    Args:
+        path_or_url: 本地路径或网络URL
+
+    Returns:
+        实际可读取的图片路径，失败返回 None
+    """
+    path = Path(path_or_url).expanduser()
+
+    # 本地文件存在
+    if path.exists():
+        return path
+
+    # 尝试下载网络图片
+    if path_or_url.startswith(('http://', 'https://')):
+        return download_url_to_temp(path_or_url)
+
+    return None
 
 
 def extract_local_image_paths(text: str) -> tuple[str, list[Path]]:
@@ -2758,12 +2807,13 @@ def generate_and_upload_image(prompt: str, model: str = DEFAULT_IMAGE_MODEL, ver
     # 如果有参考图片，读取并编码
     ref_image_data = None
     if ref_image:
-        ref_path = Path(ref_image).expanduser()
-        if ref_path.exists():
+        # 支持本地路径和网络URL
+        ref_path = resolve_image_path(ref_image)
+        if ref_path:
             with open(ref_path, "rb") as f:
                 ref_image_data = base64.b64encode(f.read()).decode()
         else:
-            return f"[错误] 参考图片不存在: {ref_image}"
+            return f"[错误] 参考图片不存在或下载失败: {ref_image}"
 
     # 生成图片
     image_data, source, error = generate_image(prompt, model, ref_image_data)
@@ -2870,18 +2920,19 @@ def describe_image_json(image_path: str, model: str = "gemini-3-flash-preview") 
     """获取图片的JSON描述 (用于精准修图)
 
     降级链: YUNWU -> Google-API
+    支持本地路径和网络URL
 
     Args:
-        image_path: 图片路径
+        image_path: 图片路径或URL
         model: 使用的模型
 
     Returns:
         JSON格式的图片描述，或错误信息
     """
-    # 读取图片并编码
-    img_path = Path(image_path).expanduser()
-    if not img_path.exists():
-        return f"[错误] 图片不存在: {image_path}"
+    # 读取图片并编码（支持本地路径和网络URL）
+    img_path = resolve_image_path(image_path)
+    if not img_path:
+        return f"[错误] 图片不存在或下载失败: {image_path}"
 
     with open(img_path, "rb") as f:
         image_b64 = base64.b64encode(f.read()).decode()
@@ -2971,8 +3022,10 @@ def _generate_image_google_dedicated(prompt: str, ref_image_b64: str = None) -> 
 def edit_image_with_json(image_path: str, json_desc: str, model: str = DEFAULT_IMAGE_MODEL, verbose: bool = True) -> str:
     """根据JSON描述生成新图片 (JSON精准修图)
 
+    支持本地路径和网络URL作为参考图
+
     Args:
-        image_path: 原图路径 (可选，用于参考)
+        image_path: 原图路径或URL (可选，用于参考)
         json_desc: 修改后的JSON描述
         model: 图片生成模型
         verbose: 是否显示详细信息
@@ -2983,8 +3036,8 @@ def edit_image_with_json(image_path: str, json_desc: str, model: str = DEFAULT_I
     # 构建生成提示词
     prompt = f"请根据以下JSON描述生成一张新图片：\n\n{json_desc}"
 
-    # 如果提供了原图，作为参考
-    ref_image = image_path if image_path and Path(image_path).expanduser().exists() else None
+    # 如果提供了原图，作为参考（支持URL和本地路径）
+    ref_image = image_path if image_path else None
 
     return generate_and_upload_image(prompt, model, verbose, ref_image)
 
@@ -3098,7 +3151,7 @@ def main():
     parser.add_argument('--draw', '-d', nargs='*', metavar='WORD',
                         help='生成图片，支持免引号 (如: gchat -d a cute cat)')
     parser.add_argument('--image-model', type=str, default=DEFAULT_IMAGE_MODEL,
-                        help='图片生成模型 (image, image-2k, image-4k, image-flash)')
+                        help='图片生成模型 (image, image-flash)')
     parser.add_argument('--ref', '-r', type=str, metavar='IMAGE_PATH',
                         help='参考图片路径 (垫图，用于图生图)')
     parser.add_argument('--describe', '-D', type=str, metavar='IMAGE_PATH',
