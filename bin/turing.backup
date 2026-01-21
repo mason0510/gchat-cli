@@ -2291,8 +2291,6 @@ def _generate_image_zyai(prompt: str, model: str) -> tuple[bytes, str] | tuple[N
     import urllib.error
 
     url = ZYAI_IMAGE_CONFIG["url"].replace("{model}", model)
-    if not url:
-        return None, "ZYAI URL未配置"
     headers = {
         "Authorization": f"Bearer {ZYAI_IMAGE_CONFIG['key']}",
         "Content-Type": "application/json"
@@ -2334,8 +2332,6 @@ def _generate_image_nexusai(prompt: str, model: str) -> tuple[bytes, str] | tupl
     import urllib.error
 
     url = NEXUSAI_IMAGE_CONFIG["url"]
-    if not url:
-        return None, "NexusAI URL未配置"
     headers = {
         "Authorization": f"Bearer {NEXUSAI_IMAGE_CONFIG['key']}",
         "Content-Type": "application/json"
@@ -2381,9 +2377,6 @@ def _generate_image_gptload(prompt: str, model: str) -> tuple[bytes, str] | tupl
     import urllib.error
 
     url = GPTLOAD_IMAGE_CONFIG["url"]
-    # 如果 URL 为空，跳过此服务
-    if not url:
-        return None, "GPT-Load URL未配置"
     headers = {
         "Authorization": f"Bearer {GPTLOAD_IMAGE_CONFIG['key']}",
         "Content-Type": "application/json"
@@ -2432,9 +2425,6 @@ def _generate_image_yunwu(prompt: str, model: str, ref_image_b64: str = None) ->
         ref_image_b64: 参考图片的base64编码 (用于图生图)
     """
     import urllib.request
-    url = YUNWU_IMAGE_CONFIG["url"]
-    if not url:
-        return None, "YUNWU URL未配置"
     import urllib.error
 
     url = YUNWU_IMAGE_CONFIG["url"]
